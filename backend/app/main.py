@@ -57,14 +57,17 @@ def _check_and_trigger_alert(db: Session, site: WaterHeritageSite, old_status: O
             'coordinates': {'lng': site.longitude, 'lat': site.latitude}
         }
         mqtt_topic = f"heritage/alert/{site.id}"
-        mqtt_published = mqtt_service.publish_alert(site.id, alert_data)
+        mqtt_result = mqtt_service.publish_alert(site.id, alert_data)
+        mqtt_published = mqtt_result['status'] in ('publishing', 'published')
+        mqtt_message_id = mqtt_result.get('message_id')
 
         db_alert = AlertRecord(
             site_id=site.id,
             alert_type='文物保护预警',
             alert_level='紧急',
             message=f'水利遗迹【{site.name}】保存状态已恶化为完全废弃，请立即采取保护措施！',
-            mqtt_topic=mqtt_topic if mqtt_published else None
+            mqtt_topic=mqtt_topic if mqtt_published else None,
+            mqtt_message_id=mqtt_message_id
         )
         db.add(db_alert)
         db.commit()
@@ -1018,6 +1021,182 @@ async def get_dynasties(db: Session = Depends(get_db)):
         'end_year': d.end_year,
         'order': d.order
     } for d in dynasties]
+
+
+@app.post("/api/sites/{site_id}/monte-carlo")
+async def run_monte_carlo_analysis(
+    site_id: int,
+    n_simulations: int = Query(1000, description="蒙特卡洛模拟次数"),
+    db: Session = Depends(get_db)
+):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹未找到")
+
+    regions = ['中原地区', '关中地区', '江南地区', '巴蜀地区',
+               '岭南地区', '江淮地区', '山东地区', '河北地区',
+               '河东地区', '河西地区', '辽东地区', '滇黔地区']
+    region = regions[hash(site.name) % len(regions)]
+
+    hydro_data = db.query(PaleoHydrologyData).filter(
+        PaleoHydrologyData.region == region
+    ).all()
+
+    try:
+        mc_result = restoration_model.monte_carlo_analysis(
+            site, hydro_data, n_simulations=n_simulations
+        )
+
+        existing = db.query(FunctionalRestoration).filter(
+            FunctionalRestoration.site_id == site_id
+        ).first()
+        if existing:
+            existing.uncertainty_analysis = mc_result
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "n_simulations": n_simulations,
+            "uncertainty_analysis": mc_result
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"蒙特卡洛分析失败: {str(e)}")
+
+
+@app.get("/api/sites/{site_id}/parameter-estimation")
+async def get_parameter_estimation(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹未找到")
+
+    try:
+        from app.services.restoration_model import ParameterEstimator
+        estimator = ParameterEstimator()
+        estimated = estimator.estimate_parameters(site)
+
+        existing = db.query(FunctionalRestoration).filter(
+            FunctionalRestoration.site_id == site_id
+        ).first()
+        if existing:
+            existing.parameter_estimation = estimated
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "parameter_estimation": estimated
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"参数估计失败: {str(e)}")
+
+
+@app.get("/api/ahp/experts")
+async def get_ahp_experts():
+    try:
+        from app.services.ahp_assessment import AHPGroupDecision
+        expert_info = AHPGroupDecision.get_expert_info()
+        return {"experts": expert_info}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/ahp/group-weights")
+async def get_ahp_group_weights():
+    try:
+        from app.services.ahp_assessment import AHPGroupDecision
+        group_decision = AHPGroupDecision()
+        result = group_decision.get_aggregated_weights()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/ahp/check-consistency")
+async def check_ahp_consistency(weights: AHPCriteriaWeights):
+    try:
+        weight_dict = {
+            'structural': weights.structural,
+            'hydrological': weights.hydrological,
+            'economic': weights.economic,
+            'cultural': weights.cultural,
+            'environmental': weights.environmental
+        }
+        from app.services.ahp_assessment import AHPGroupDecision
+        result = AHPGroupDecision.check_weights_consistency(weight_dict)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/mqtt/status")
+async def get_mqtt_status():
+    info = mqtt_service.get_connection_info()
+    return info
+
+
+@app.get("/api/mqtt/pending-count")
+async def get_mqtt_pending_count():
+    count = mqtt_service.get_pending_count()
+    return count
+
+
+@app.get("/api/mqtt/messages/{message_id}/status")
+async def get_mqtt_message_status(message_id: str):
+    status = mqtt_service.get_message_status(message_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="消息不存在或已发送完成")
+    return status
+
+
+@app.get("/api/mqtt/dead-letter")
+async def get_mqtt_dead_letter(limit: int = 50):
+    msgs = mqtt_service.get_dead_letter_messages(limit=limit)
+    return {"count": len(msgs), "messages": msgs}
+
+
+@app.delete("/api/mqtt/dead-letter")
+async def clear_mqtt_dead_letter():
+    count = mqtt_service.clear_dead_letter()
+    return {"cleared": count}
+
+
+@app.post("/api/mqtt/reconnect")
+async def mqtt_manual_reconnect():
+    success = mqtt_service.manual_reconnect()
+    return {"reconnect_triggered": success}
+
+
+@app.get("/api/restoration/supply-ranges/simplified")
+async def get_simplified_supply_ranges(
+    tolerance: float = Query(0.001, description="简化容差（度）"),
+    db: Session = Depends(get_db)
+):
+    restorations = db.query(FunctionalRestoration).filter(
+        FunctionalRestoration.water_supply_range_geom.isnot(None)
+    ).all()
+
+    features = []
+    for r in restorations:
+        try:
+            from shapely.geometry import mapping as shapely_mapping
+            shp = to_shape(r.water_supply_range_geom)
+            simplified = shp.simplify(tolerance, preserve_topology=True)
+
+            feat = {
+                "type": "Feature",
+                "id": f"range_{r.site_id}",
+                "geometry": shapely_mapping(simplified),
+                "properties": {
+                    "site_id": r.site_id,
+                    "original_capacity": r.original_irrigation_capacity,
+                    "actual_capacity": r.actual_irrigation_capacity,
+                    "supply_population": r.supply_population
+                }
+            }
+            features.append(feat)
+        except Exception:
+            continue
+
+    return {"type": "FeatureCollection", "features": features, "tolerance": tolerance}
 
 
 if __name__ == "__main__":

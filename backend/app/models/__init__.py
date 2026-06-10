@@ -63,6 +63,8 @@ class FunctionalRestoration(Base):
     water_supply_range_geom = Column(Geometry(geometry_type='POLYGON', srid=4326), index=True)
     supply_population = Column(Integer)
     restoration_notes = Column(Text)
+    parameter_estimation = Column(JSON)
+    uncertainty_analysis = Column(JSON)
     calculated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -80,6 +82,7 @@ class SustainabilityAssessment(Base):
     grade = Column(String(2), nullable=False)
     restoration_potential = Column(Boolean, nullable=False)
     assessment_details = Column(JSON)
+    group_decision_info = Column(JSON)
     assessed_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -92,6 +95,8 @@ class AlertRecord(Base):
     alert_level = Column(String(20), nullable=False, index=True)
     message = Column(Text, nullable=False)
     mqtt_topic = Column(String(200))
+    mqtt_message_id = Column(String(100))
+    mqtt_status = Column(String(20))
     acknowledged = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 

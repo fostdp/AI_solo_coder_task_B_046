@@ -4,14 +4,17 @@ const appState = {
     map: null,
     sitesLayer: null,
     supplyRangesLayer: null,
+    supplyRangeRenderer: null,
     canvasLayer: null,
     sites: [],
     filteredSites: [],
+    supplyRanges: [],
     selectedSite: null,
     showSupplyRange: true,
     showHexagon: true,
     sizeByArea: true,
-    colorByStatus: true
+    colorByStatus: true,
+    useHighPerformanceRenderer: true
 };
 
 const STATUS_COLORS = {
@@ -73,6 +76,14 @@ function initCanvasLayer() {
     appState.canvasLayer = L.canvas({ padding: 0.5 });
     appState.sitesLayer = L.layerGroup().addTo(appState.map);
     appState.supplyRangesLayer = L.layerGroup().addTo(appState.map);
+
+    if (appState.useHighPerformanceRenderer && typeof SupplyRangeRenderer !== 'undefined') {
+        appState.supplyRangeRenderer = new SupplyRangeRenderer(appState.map, {
+            onClick: (range) => {
+                if (range.siteId) selectSite(range.siteId);
+            }
+        });
+    }
 }
 
 function drawHexagon(ctx, x, y, radius, fillColor, strokeColor) {
@@ -227,25 +238,33 @@ async function loadSupplyRanges() {
     try {
         const res = await fetch(`${API_BASE}/restoration/supply-ranges`);
         const data = await res.json();
+        appState.supplyRanges = data.features || [];
 
-        data.features.forEach(f => {
-            const layer = L.geoJSON(f, {
-                style: {
-                    color: '#4299e1',
-                    weight: 1.5,
-                    fillColor: '#4299e1',
-                    fillOpacity: 0.2,
-                    dashArray: '4, 4'
-                }
+        if (appState.supplyRangeRenderer) {
+            appState.supplyRangeRenderer.setRanges(appState.supplyRanges);
+            if (!appState.showSupplyRange) {
+                appState.supplyRangeRenderer.hide();
+            }
+        } else {
+            data.features.forEach(f => {
+                const layer = L.geoJSON(f, {
+                    style: {
+                        color: '#4299e1',
+                        weight: 1.5,
+                        fillColor: '#4299e1',
+                        fillOpacity: 0.2,
+                        dashArray: '4, 4'
+                    }
+                });
+                layer.bindPopup(`
+                    <strong>灌溉区范围</strong><br/>
+                    原始灌溉能力: ${f.properties.original_capacity?.toFixed(2)} 亩<br/>
+                    实际灌溉能力: ${f.properties.actual_capacity?.toFixed(2)} 亩<br/>
+                    可服务人口: 约 ${f.properties.supply_population || 0} 人
+                `);
+                layer.addTo(appState.supplyRangesLayer);
             });
-            layer.bindPopup(`
-                <strong>灌溉区范围</strong><br/>
-                原始灌溉能力: ${f.properties.original_capacity?.toFixed(2)} 亩<br/>
-                实际灌溉能力: ${f.properties.actual_capacity?.toFixed(2)} 亩<br/>
-                可服务人口: 约 ${f.properties.supply_population || 0} 人
-            `);
-            layer.addTo(appState.supplyRangesLayer);
-        });
+        }
     } catch (e) {
         console.warn('加载灌溉范围失败:', e);
     }
@@ -343,6 +362,10 @@ async function selectSite(siteId) {
         }
 
         renderDetailPanel(comp, hydro, section);
+
+        if (appState.supplyRangeRenderer) {
+            appState.supplyRangeRenderer.setSelected(siteId);
+        }
 
         const site = appState.sites.find(s => s.id === siteId);
         if (site) {
@@ -852,7 +875,20 @@ function setupEventListeners() {
 
     document.getElementById('showSupplyRange').addEventListener('change', e => {
         appState.showSupplyRange = e.target.checked;
-        renderSites();
+        if (appState.supplyRangeRenderer) {
+            if (e.target.checked) {
+                appState.supplyRangeRenderer.show();
+            } else {
+                appState.supplyRangeRenderer.hide();
+            }
+        } else {
+            if (e.target.checked) {
+                if (appState.supplyRanges.length === 0) loadSupplyRanges();
+                appState.supplyRangesLayer.addTo(appState.map);
+            } else {
+                appState.supplyRangesLayer.remove();
+            }
+        }
     });
     document.getElementById('showHexagon').addEventListener('change', e => {
         appState.showHexagon = e.target.checked;
