@@ -3,138 +3,175 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>智慧油田注水开发动态调控系统</title>
+    <title>古代水利工程遗迹功能复原与可持续性评估系统</title>
+
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <link rel="stylesheet" href="css/style.css" />
 </head>
 <body>
-    <div class="app-container">
-        <header class="app-header">
-            <h1>智慧油田注水开发动态调控系统</h1>
-            <div class="header-info">
-                <span id="current-time">--</span>
-                <span class="status-indicator online">系统在线</span>
+    <header class="app-header">
+        <div class="header-content">
+            <h1 class="app-title">
+                <span class="title-icon">🏛️</span>
+                古代水利工程遗迹功能复原与可持续性评估系统
+            </h1>
+            <div class="header-stats" id="headerStats">
+                <div class="stat-item"><span class="stat-label">遗迹总数</span><span class="stat-value" id="statTotal">0</span></div>
+                <div class="stat-item"><span class="stat-label">完好</span><span class="stat-value good" id="statGood">0</span></div>
+                <div class="stat-item"><span class="stat-label">部分损毁</span><span class="stat-value warn" id="statWarn">0</span></div>
+                <div class="stat-item"><span class="stat-label">完全废弃</span><span class="stat-value danger" id="statDanger">0</span></div>
+                <div class="stat-item"><span class="stat-label">修复潜力</span><span class="stat-value potential" id="statPotential">0</span></div>
+                <div class="stat-item"><span class="stat-label">告警</span><span class="stat-value alert" id="statAlerts">0</span></div>
             </div>
-        </header>
+        </div>
+    </header>
 
-        <div class="main-content">
-            <aside class="left-panel">
-                <div class="panel-section">
-                    <h3>核心指标</h3>
-                    <div class="indicator-cards">
-                        <div class="indicator-card oil">
-                            <div class="indicator-label">日产油量</div>
-                            <div class="indicator-value" id="daily-oil">--</div>
-                            <div class="indicator-unit">t</div>
-                            <div class="indicator-change" id="oil-change">--</div>
-                        </div>
-                        <div class="indicator-card water">
-                            <div class="indicator-label">日注水量</div>
-                            <div class="indicator-value" id="daily-water">--</div>
-                            <div class="indicator-unit">m³</div>
-                            <div class="indicator-change" id="water-change">--</div>
-                        </div>
-                        <div class="indicator-card cut">
-                            <div class="indicator-label">综合含水率</div>
-                            <div class="indicator-value" id="water-cut">--</div>
-                            <div class="indicator-unit">%</div>
-                            <div class="indicator-change" id="cut-change">--</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="panel-section">
-                    <h3>区块筛选</h3>
-                    <select id="block-selector" class="form-control">
-                        <option value="ALL">全部区块</option>
+    <div class="main-container">
+        <aside class="sidebar">
+            <div class="sidebar-section">
+                <h3>筛选条件</h3>
+                <div class="filter-group">
+                    <label>工程类型</label>
+                    <select id="filterType">
+                        <option value="">全部类型</option>
+                        <option value="渠">渠</option>
+                        <option value="堰">堰</option>
+                        <option value="陂">陂</option>
+                        <option value="塘">塘</option>
+                        <option value="井">井</option>
                     </select>
                 </div>
-
-                <div class="panel-section">
-                    <h3>图层控制</h3>
-                    <div class="layer-controls">
-                        <label class="checkbox-item">
-                            <input type="checkbox" id="show-injection" checked>
-                            <span class="legend-circle injection"></span>
-                            注水井
-                        </label>
-                        <label class="checkbox-item">
-                            <input type="checkbox" id="show-production" checked>
-                            <span class="legend-triangle production"></span>
-                            采油井
-                        </label>
-                        <label class="checkbox-item">
-                            <input type="checkbox" id="show-relations" checked>
-                            <span class="legend-line"></span>
-                            注采对应关系
-                        </label>
-                        <label class="checkbox-item">
-                            <input type="checkbox" id="show-allocation" checked>
-                            <span class="legend-arrow"></span>
-                            调配建议
-                        </label>
+                <div class="filter-group">
+                    <label>朝代</label>
+                    <select id="filterDynasty">
+                        <option value="">全部朝代</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>保存状态</label>
+                    <select id="filterStatus">
+                        <option value="">全部状态</option>
+                        <option value="完好">完好</option>
+                        <option value="部分损毁">部分损毁</option>
+                        <option value="完全废弃">完全废弃</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>灌溉面积 (亩)</label>
+                    <div class="range-inputs">
+                        <input type="number" id="minArea" placeholder="最小" step="10">
+                        <span>-</span>
+                        <input type="number" id="maxArea" placeholder="最大" step="10">
                     </div>
                 </div>
+                <div class="filter-actions">
+                    <button id="applyFilter" class="btn btn-primary">应用筛选</button>
+                    <button id="resetFilter" class="btn btn-secondary">重置</button>
+                </div>
+            </div>
 
-                <div class="panel-section">
-                    <h3>注采受效图例</h3>
-                    <div class="legend-items">
-                        <div class="legend-item">
-                            <span class="legend-line" style="background: #00FF00;"></span>
-                            <span>高效受效</span>
-                        </div>
-                        <div class="legend-item">
-                            <span class="legend-line" style="background: #FFFF00;"></span>
-                            <span>中等受效</span>
-                        </div>
-                        <div class="legend-item">
-                            <span class="legend-line" style="background: #FF0000;"></span>
-                            <span>无效受效</span>
-                        </div>
+            <div class="sidebar-section">
+                <h3>图层控制</h3>
+                <label class="checkbox-item">
+                    <input type="checkbox" id="showSupplyRange" checked>
+                    <span>显示灌溉范围</span>
+                </label>
+                <label class="checkbox-item">
+                    <input type="checkbox" id="showHexagon" checked>
+                    <span>六边形标记</span>
+                </label>
+                <label class="checkbox-item">
+                    <input type="checkbox" id="sizeByArea" checked>
+                    <span>大小按灌溉面积分级</span>
+                </label>
+                <label class="checkbox-item">
+                    <input type="checkbox" id="colorByStatus" checked>
+                    <span>颜色按保存状态</span>
+                </label>
+            </div>
+
+            <div class="sidebar-section">
+                <h3>批量操作</h3>
+                <div class="action-buttons">
+                    <button id="restoreAllBtn" class="btn btn-warning">🔧 计算全部功能复原</button>
+                    <button id="assessAllBtn" class="btn btn-info">📊 评估全部可持续性</button>
+                    <button id="importDataBtn" class="btn btn-success">📥 导入模拟数据</button>
+                </div>
+            </div>
+
+            <div class="sidebar-section">
+                <h3>图例说明</h3>
+                <div class="legend">
+                    <div class="legend-item">
+                        <span class="legend-color good"></span>
+                        <span>完好</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color warn"></span>
+                        <span>部分损毁</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color danger"></span>
+                        <span>完全废弃</span>
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color range"></span>
+                        <span>复原灌溉区</span>
                     </div>
                 </div>
-
-                <div class="panel-section">
-                    <h3>告警信息 <span class="badge" id="alarm-badge">0</span></h3>
-                    <div class="alarm-list" id="alarm-list">
-                        <div class="no-data">暂无告警</div>
+                <div class="size-legend">
+                    <div class="legend-title">灌溉面积等级</div>
+                    <div class="size-items">
+                        <span class="hex-size hex-xs"></span>
+                        <span>小</span>
+                        <span class="hex-size hex-sm"></span>
+                        <span>中</span>
+                        <span class="hex-size hex-md"></span>
+                        <span>大</span>
+                        <span class="hex-size hex-lg"></span>
+                        <span>特大</span>
                     </div>
                 </div>
-            </aside>
+            </div>
+        </aside>
 
-            <main class="map-container">
-                <div id="map"></div>
-                <canvas id="well-canvas"></canvas>
-                <div class="map-controls">
-                    <button class="control-btn" onclick="refreshAllData()">
-                        <span>🔄</span> 刷新数据
-                    </button>
-                    <button class="control-btn" onclick="runAllocation()">
-                        <span>📊</span> 生成调配建议
-                    </button>
-                    <button class="control-btn" onclick="checkAlarms()">
-                        <span>⚠️</span> 检查告警
-                    </button>
-                </div>
-            </main>
+        <main class="map-container">
+            <div id="map" class="map"></div>
 
-            <aside class="right-panel" id="detail-panel" style="display: none;">
-                <div class="panel-header">
-                    <h3 id="detail-title">井详情</h3>
-                    <button class="close-btn" onclick="closeDetailPanel()">×</button>
+            <div class="map-controls">
+                <div class="search-box">
+                    <input type="text" id="searchInput" placeholder="搜索遗迹名称...">
+                    <button id="searchBtn">🔍</button>
+                    <div class="search-results" id="searchResults"></div>
                 </div>
-                <div class="panel-content" id="detail-content">
+            </div>
+
+            <div id="toastContainer" class="toast-container"></div>
+        </main>
+
+        <aside class="detail-panel" id="detailPanel">
+            <div class="panel-header">
+                <h3>遗迹详细信息</h3>
+                <button class="close-btn" id="closePanel">&times;</button>
+            </div>
+            <div class="panel-content" id="panelContent">
+                <div class="empty-state">
+                    <p>在地图上点击遗迹以查看详细信息</p>
+                    <div class="hint-icon">🗺️</div>
                 </div>
-            </aside>
+            </div>
+        </aside>
+    </div>
+
+    <div class="alert-banner" id="alertBanner" style="display:none;">
+        <div class="alert-content">
+            <span class="alert-icon">🚨</span>
+            <span class="alert-text" id="alertText">文物保护预警：有遗迹保存状态恶化为完全废弃</span>
+            <button class="alert-close" id="alertClose">&times;</button>
         </div>
     </div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <script src="js/config.js"></script>
-    <script src="js/api.js"></script>
-    <script src="js/map.js"></script>
-    <script src="js/charts.js"></script>
     <script src="js/app.js"></script>
 </body>
 </html>

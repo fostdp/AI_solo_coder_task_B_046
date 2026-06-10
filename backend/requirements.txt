@@ -1,0 +1,13 @@
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+SQLAlchemy==2.0.23
+GeoAlchemy2==0.14.6
+psycopg2-binary==2.9.9
+pydantic==2.5.2
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+paho-mqtt==1.6.1
+numpy==1.26.2
+shapely==2.0.2
+geojson==3.1.0
+python-dotenv==1.0.0
