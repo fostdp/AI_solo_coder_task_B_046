@@ -57,7 +57,16 @@ from common.params.crop_params import (
 )
 from common.params.hydraulic_params import REGIONS
 
-from .aquacrop_model import AgriculturalImpactAnalyzer
+from .aquacrop_model import AgriculturalImpactAnalyzer, AquaCropSimplifiedModel
+from .ensemble_simulation import (
+    ParameterSensitivityAnalyzer,
+    EnsembleAquaCropSimulator,
+    _safe_mean,
+    _safe_std,
+    _safe_percentile,
+    _safe_div,
+    _clamp,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agriculture_impact")
@@ -528,6 +537,467 @@ def get_system_stats(db: Session = Depends(get_db)):
         "high_confidence_count": high_conf_count,
         "assessments_with_benefit_zone": zone_count,
     }
+
+
+# ==============================================
+# 敏感性分析与集合模拟 Pydantic 模型
+# ==============================================
+
+class _EnsembleRequest(BaseModel):
+    n_members: int = Field(50, ge=20, le=200, description="集合成员数")
+    method: str = Field('lhs', pattern='^(lhs|mc)$', description="抽样方法: lhs=拉丁超立方, mc=蒙特卡洛")
+    with_observations: bool = Field(False, description="是否使用观测数据加权")
+
+
+class _BatchEnsembleRequest(BaseModel):
+    region: str = Field(..., max_length=64, description="区域名称")
+    n_members: int = Field(50, ge=20, le=200, description="集合成员数")
+    method: str = Field('lhs', pattern='^(lhs|mc)$', description="抽样方法")
+
+
+# ==============================================
+# 参数敏感性分析 API
+# ==============================================
+
+@router.get("/sites/{site_id}/impact/sensitivity")
+def get_site_sensitivity(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    assessment = db.query(AgriculturalImpactAssessment).filter(
+        AgriculturalImpactAssessment.site_id == site_id
+    ).first()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="请先执行农业影响评估")
+
+    try:
+        region = _get_site_region(site)
+        dominant_crop = assessment.dominant_crop or '粟'
+        dynasty_order = site.dynasty_order or 11
+
+        baseline_yield = get_baseline_yield(region, dominant_crop, dynasty_order)
+        climate = _analyzer._generate_historical_climate_series(
+            region, dynasty_order,
+            AquaCropSimplifiedModel(dominant_crop, region).total_growing_days
+        )
+
+        irrigation_capability = 0.0
+        irrigation_area = float(assessment.total_influenced_area_mu) if assessment else 100.0
+        if assessment.yield_simulation_raw:
+            irrigation_capability = float(
+                assessment.yield_simulation_raw.get('irrigation_capability_m3_per_day', 0.0)
+            )
+
+        analyzer = ParameterSensitivityAnalyzer(dominant_crop, region)
+        baseline_params = dict(analyzer.param_baselines)
+
+        local_results = analyzer.analyze_local_sensitivity(
+            AquaCropSimplifiedModel,
+            baseline_params,
+            climate['precipitation_mm'],
+            climate['et0_mm'],
+            climate['temperatures_c'],
+            irrigation_capability=irrigation_capability,
+            irrigation_area=irrigation_area,
+            baseline_yield=baseline_yield,
+            n_levels=5,
+        )
+
+        report = analyzer.generate_sensitivity_report(local_results)
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "crop_type": dominant_crop,
+            "region": region,
+            "sensitivity_results": local_results,
+            "report": report,
+        }
+    except Exception as e:
+        logger.error(f"敏感性分析失败 site_id={site_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"敏感性分析失败: {str(e)}")
+
+
+# ==============================================
+# 集合模拟 API
+# ==============================================
+
+@router.post("/sites/{site_id}/impact/ensemble")
+def run_site_ensemble(
+    site_id: int,
+    request: Optional[_EnsembleRequest] = None,
+    db: Session = Depends(get_db)
+):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    assessment = db.query(AgriculturalImpactAssessment).filter(
+        AgriculturalImpactAssessment.site_id == site_id
+    ).first()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="请先执行农业影响评估")
+
+    try:
+        n_members = request.n_members if request else 50
+        method = request.method if request else 'lhs'
+
+        region = _get_site_region(site)
+        dominant_crop = assessment.dominant_crop or '粟'
+        dynasty_order = site.dynasty_order or 11
+
+        baseline_yield = get_baseline_yield(region, dominant_crop, dynasty_order)
+        climate = _analyzer._generate_historical_climate_series(
+            region, dynasty_order,
+            AquaCropSimplifiedModel(dominant_crop, region).total_growing_days
+        )
+
+        irrigation_capability = 0.0
+        irrigation_area = float(assessment.total_influenced_area_mu) if assessment else 100.0
+        if assessment.yield_simulation_raw:
+            irrigation_capability = float(
+                assessment.yield_simulation_raw.get('irrigation_capability_m3_per_day', 0.0)
+            )
+
+        simulator = EnsembleAquaCropSimulator(dominant_crop, region, n_members=n_members)
+        raw_results = simulator.run_ensemble_simulation(
+            precip_list=climate['precipitation_mm'],
+            et0_list=climate['et0_mm'],
+            temp_list=climate['temperatures_c'],
+            irrigation_capability=irrigation_capability,
+            irrigation_area=irrigation_area,
+            baseline_yield=baseline_yield,
+            dynasty_order=dynasty_order,
+            method=method,
+        )
+
+        observations = None
+        if request and request.with_observations:
+            observations = [baseline_yield * (1.0 + 0.1 * i) for i in range(-2, 3)]
+
+        post_processed = simulator.post_process_ensemble_results(
+            raw_results,
+            include_members=True,
+            observations=observations,
+        )
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "crop_type": dominant_crop,
+            "region": region,
+            "config": post_processed.get('config', {}),
+            "statistics": post_processed.get('statistics', {}),
+            "post_processed": post_processed.get('post_processed', {}),
+            "reliability": post_processed.get('reliability', {}),
+            "members": post_processed.get('members', []),
+        }
+    except Exception as e:
+        logger.error(f"集合模拟失败 site_id={site_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"集合模拟失败: {str(e)}")
+
+
+@router.get("/sites/{site_id}/impact/ensemble/uncertainty")
+def get_site_uncertainty(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    assessment = db.query(AgriculturalImpactAssessment).filter(
+        AgriculturalImpactAssessment.site_id == site_id
+    ).first()
+    if not assessment:
+        raise HTTPException(status_code=404, detail="请先执行农业影响评估")
+
+    try:
+        region = _get_site_region(site)
+        dominant_crop = assessment.dominant_crop or '粟'
+        dynasty_order = site.dynasty_order or 11
+
+        baseline_yield = get_baseline_yield(region, dominant_crop, dynasty_order)
+        climate = _analyzer._generate_historical_climate_series(
+            region, dynasty_order,
+            AquaCropSimplifiedModel(dominant_crop, region).total_growing_days
+        )
+
+        irrigation_capability = 0.0
+        irrigation_area = float(assessment.total_influenced_area_mu) if assessment else 100.0
+        if assessment.yield_simulation_raw:
+            irrigation_capability = float(
+                assessment.yield_simulation_raw.get('irrigation_capability_m3_per_day', 0.0)
+            )
+
+        sensitivity_analyzer = ParameterSensitivityAnalyzer(dominant_crop, region)
+        baseline_params = dict(sensitivity_analyzer.param_baselines)
+        local_sensitivity = sensitivity_analyzer.analyze_local_sensitivity(
+            AquaCropSimplifiedModel,
+            baseline_params,
+            climate['precipitation_mm'],
+            climate['et0_mm'],
+            climate['temperatures_c'],
+            irrigation_capability=irrigation_capability,
+            irrigation_area=irrigation_area,
+            baseline_yield=baseline_yield,
+            n_levels=3,
+        )
+
+        simulator = EnsembleAquaCropSimulator(dominant_crop, region, n_members=30)
+        raw_results = simulator.run_ensemble_simulation(
+            precip_list=climate['precipitation_mm'],
+            et0_list=climate['et0_mm'],
+            temp_list=climate['temperatures_c'],
+            irrigation_capability=irrigation_capability,
+            irrigation_area=irrigation_area,
+            baseline_yield=baseline_yield,
+            dynasty_order=dynasty_order,
+            method='lhs',
+        )
+
+        stats = raw_results.get('statistics', {})
+        mean_yield = stats.get('mean_yield', baseline_yield)
+        ci_lower = stats.get('ci_95_lower', mean_yield)
+        ci_upper = stats.get('ci_95_upper', mean_yield)
+        cv = stats.get('cv', 0.0)
+
+        ci_width_pct = _safe_div(ci_upper - ci_lower, mean_yield, 0.0) * 100.0
+
+        if cv < 0.10:
+            reliability_level = "可靠"
+        elif cv < 0.20:
+            reliability_level = "较可靠"
+        elif cv < 0.30:
+            reliability_level = "较大"
+        else:
+            reliability_level = "大"
+
+        total_sensitivity = sum(
+            d.get('sensitivity', 0.0) for d in local_sensitivity.values()
+        )
+        param_uncertainty_contribution: Dict[str, float] = {}
+        sorted_sensitivity = sorted(
+            local_sensitivity.items(),
+            key=lambda x: x[1].get('sensitivity', 0.0),
+            reverse=True,
+        )
+        for param, data in sorted_sensitivity:
+            param_uncertainty_contribution[param] = round(
+                _safe_div(data.get('sensitivity', 0.0), total_sensitivity, 0.0) * 100.0,
+                2,
+            )
+
+        n_members = raw_results.get('config', {}).get('n_members', 30)
+        converged = raw_results.get('reliability', {}).get('pit_uniformity', 0.0) > 0.7
+        suggestions = []
+        if n_members < 50:
+            suggestions.append("建议增加集合成员数至 50+ 以提高稳定性")
+        if not converged:
+            suggestions.append("集合尚未完全收敛，建议增加成员数或检查输入数据")
+        if cv > 0.20:
+            suggestions.append("不确定性较大，建议补充观测数据进行约束校准")
+        if len(suggestions) == 0:
+            suggestions.append("模拟结果可靠，当前配置满足要求")
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "crop_type": dominant_crop,
+            "region": region,
+            "uncertainty_summary": {
+                "mean_yield_kg_per_mu": round(mean_yield, 2),
+                "ci_95_lower": round(ci_lower, 2),
+                "ci_95_upper": round(ci_upper, 2),
+                "ci_width_pct": round(ci_width_pct, 2),
+                "cv": round(cv, 4),
+                "reliability_level": reliability_level,
+            },
+            "parameter_uncertainty_contribution_pct": param_uncertainty_contribution,
+            "ensemble_diagnostics": {
+                "n_members": n_members,
+                "converged": converged,
+                "pit_uniformity": raw_results.get('reliability', {}).get('pit_uniformity', 0.0),
+                "outlier_count": raw_results.get('reliability', {}).get('outlier_count', 0),
+            },
+            "suggestions": suggestions,
+        }
+    except Exception as e:
+        logger.error(f"不确定性报告生成失败 site_id={site_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"不确定性报告生成失败: {str(e)}")
+
+
+# ==============================================
+# 全局敏感度矩阵 API
+# ==============================================
+
+@router.get("/sensitivity/matrix")
+def get_global_sensitivity_matrix(db: Session = Depends(get_db)):
+    try:
+        crops = CROP_LIST
+        regions = REGIONS
+        params = ParameterSensitivityAnalyzer.SENSITIVITY_PARAMS
+
+        matrix_data: List[Dict[str, Any]] = []
+        param_baseline_data: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+        for crop in crops:
+            param_baseline_data[crop] = {}
+            for region in regions:
+                try:
+                    analyzer = ParameterSensitivityAnalyzer(crop, region)
+                    baseline_params = dict(analyzer.param_baselines)
+                    param_baseline_data[crop][region] = {
+                        p: round(v, 4) for p, v in baseline_params.items()
+                    }
+
+                    dynasty_order = 11
+                    baseline_yield = get_baseline_yield(region, crop, dynasty_order)
+                    climate = _analyzer._generate_historical_climate_series(
+                        region, dynasty_order,
+                        AquaCropSimplifiedModel(crop, region).total_growing_days
+                    )
+
+                    local_sens = analyzer.analyze_local_sensitivity(
+                        AquaCropSimplifiedModel,
+                        baseline_params,
+                        climate['precipitation_mm'],
+                        climate['et0_mm'],
+                        climate['temperatures_c'],
+                        irrigation_capability=50.0,
+                        irrigation_area=100.0,
+                        baseline_yield=baseline_yield,
+                        n_levels=3,
+                    )
+
+                    for param in params:
+                        sens_data = local_sens.get(param, {})
+                        matrix_data.append({
+                            "crop": crop,
+                            "region": region,
+                            "parameter": param,
+                            "sensitivity": sens_data.get('sensitivity', 0.0),
+                            "pct_change": sens_data.get('pct_change', 0.0),
+                            "rank": sens_data.get('rank', 0),
+                        })
+                except Exception:
+                    for param in params:
+                        matrix_data.append({
+                            "crop": crop,
+                            "region": region,
+                            "parameter": param,
+                            "sensitivity": 0.0,
+                            "pct_change": 0.0,
+                            "rank": 0,
+                        })
+                    continue
+
+        return {
+            "dimensions": {
+                "crops": crops,
+                "regions": regions,
+                "parameters": params,
+            },
+            "matrix": matrix_data,
+            "baseline_params": param_baseline_data,
+        }
+    except Exception as e:
+        logger.error(f"全局敏感度矩阵生成失败: {e}")
+        raise HTTPException(status_code=500, detail=f"全局敏感度矩阵生成失败: {str(e)}")
+
+
+# ==============================================
+# 区域批量集合模拟 API
+# ==============================================
+
+@router.post("/ensemble/batch-region")
+def run_batch_region_ensemble(
+    request: _BatchEnsembleRequest,
+    db: Session = Depends(get_db)
+):
+    region = request.region
+    if region not in REGIONS:
+        raise HTTPException(status_code=400, detail=f"无效的区域名称，可选: {REGIONS}")
+
+    try:
+        sites = db.query(WaterHeritageSite).all()
+        region_sites = [s for s in sites if _get_site_region(s) == region]
+
+        if not region_sites:
+            return {
+                "status": "completed",
+                "region": region,
+                "total_sites": 0,
+                "successful": 0,
+                "failed": 0,
+                "results": [],
+            }
+
+        results: List[Dict[str, Any]] = []
+        successful = 0
+        failed = 0
+
+        for site in region_sites:
+            try:
+                site_id = site.id
+                assessment = db.query(AgriculturalImpactAssessment).filter(
+                    AgriculturalImpactAssessment.site_id == site_id
+                ).first()
+
+                dominant_crop = assessment.dominant_crop if assessment else '粟'
+                dynasty_order = site.dynasty_order or 11
+
+                baseline_yield = get_baseline_yield(region, dominant_crop, dynasty_order)
+                climate = _analyzer._generate_historical_climate_series(
+                    region, dynasty_order,
+                    AquaCropSimplifiedModel(dominant_crop, region).total_growing_days
+                )
+
+                irrigation_area = float(assessment.total_influenced_area_mu) if assessment else 100.0
+                irrigation_capability = 0.0
+                if assessment and assessment.yield_simulation_raw:
+                    irrigation_capability = float(
+                        assessment.yield_simulation_raw.get('irrigation_capability_m3_per_day', 0.0)
+                    )
+
+                simulator = EnsembleAquaCropSimulator(dominant_crop, region, n_members=request.n_members)
+                raw_results = simulator.run_ensemble_simulation(
+                    precip_list=climate['precipitation_mm'],
+                    et0_list=climate['et0_mm'],
+                    temp_list=climate['temperatures_c'],
+                    irrigation_capability=irrigation_capability,
+                    irrigation_area=irrigation_area,
+                    baseline_yield=baseline_yield,
+                    dynasty_order=dynasty_order,
+                    method=request.method,
+                )
+
+                post_processed = simulator.post_process_ensemble_results(
+                    raw_results, include_members=False
+                )
+
+                results.append({
+                    "site_id": site_id,
+                    "site_name": site.name,
+                    "crop_type": dominant_crop,
+                    "mean_yield": post_processed.get('statistics', {}).get('mean_yield', 0.0),
+                    "cv": post_processed.get('statistics', {}).get('cv', 0.0),
+                    "converged": post_processed.get('post_processed', {}).get('converged', False),
+                })
+                successful += 1
+            except Exception:
+                failed += 1
+                continue
+
+        return {
+            "status": "completed",
+            "region": region,
+            "total_sites": len(region_sites),
+            "successful": successful,
+            "failed": failed,
+            "results": results,
+        }
+    except Exception as e:
+        logger.error(f"区域批量集合模拟失败 region={region}: {e}")
+        raise HTTPException(status_code=500, detail=f"区域批量集合模拟失败: {str(e)}")
 
 
 app.include_router(router)

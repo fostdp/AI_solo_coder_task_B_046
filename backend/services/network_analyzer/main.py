@@ -39,6 +39,10 @@ from .network_graph import (
     NetworkAnalyzerService,
     get_network_service,
 )
+from .network_completion import (
+    HydrologicalNetworkCompletor,
+    UncertaintyAwareNetworkAnalyzer,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("network_analyzer")
@@ -54,6 +58,9 @@ app = FastAPI(
 router = APIRouter(prefix="/api/v1/network")
 
 _analyzer_service: NetworkAnalyzerService = get_network_service()
+
+_audit_log_store: Dict[int, List[Dict[str, Any]]] = {}
+_completor_store: Dict[str, HydrologicalNetworkCompletor] = {}
 
 
 # ==============================================
@@ -796,6 +803,336 @@ def get_global_stats(db: Session = Depends(get_db)):
         "synergy_level_distribution": synergy_level_dist,
         "by_region": by_region_stats,
     }
+
+
+# ==============================================
+# 水系补全与不确定性分析 API
+# ==============================================
+
+@router.get("/regions/{region}/completion")
+def get_region_completion_suggestions(
+    region: str,
+    max_distance_km: float = Query(50, ge=1, le=200, description="最大搜索距离(km)"),
+    db: Session = Depends(get_db)
+):
+    """获取区域水系补全建议（候选边列表、置信度、证据分）"""
+    if region not in REGIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效区域: {region}，有效区域为: {', '.join(REGIONS)}"
+        )
+
+    try:
+        sites = _analyzer_service._load_sites_in_region(db, region)
+        if not sites or len(sites) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail=f"区域 {region} 内遗址数量不足（至少需要2个）"
+            )
+
+        completor = HydrologicalNetworkCompletor(region)
+        _completor_store[region] = completor
+
+        hydrology_extract = completor.extract_known_hydrology(sites)
+        known_edges = hydrology_extract['known_edges']
+        inferred_edges = completor.infer_missing_connections(sites, known_edges, max_distance_km=max_distance_km)
+
+        return {
+            "region": region,
+            "total_sites": len(sites),
+            "known_edges": len(known_edges),
+            "inferred_edge_count": len(inferred_edges),
+            "inferred_river_nodes": hydrology_extract['inferred_river_nodes'],
+            "candidate_edges": inferred_edges,
+            "completion_threshold": completor.completion_threshold,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取水系补全建议失败 region={region}: {e}")
+        raise HTTPException(status_code=500, detail=f"获取水系补全建议失败: {str(e)}")
+
+
+@router.post("/{analysis_id}/apply-corrections")
+def apply_expert_corrections(
+    analysis_id: int,
+    request_body: Dict[str, Any],
+    db: Session = Depends(get_db)
+):
+    """执行专家修正（添加边/删除边/改角色），返回修正后分析+审计日志"""
+    analysis = db.query(HydraulicNetworkAnalysis).filter(
+        HydraulicNetworkAnalysis.id == analysis_id
+    ).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+
+    corrections = request_body.get("corrections", [])
+    expert_id = request_body.get("expert_id", "unknown")
+
+    if not isinstance(corrections, list):
+        raise HTTPException(status_code=400, detail="corrections 必须是列表")
+
+    try:
+        members = db.query(NetworkMemberSite).filter(
+            NetworkMemberSite.network_analysis_id == analysis_id
+        ).all()
+        site_ids = [m.site_id for m in members]
+        sites = db.query(WaterHeritageSite).filter(
+            WaterHeritageSite.id.in_(site_ids)
+        ).all() if site_ids else []
+
+        graph = HydraulicNetworkGraph(analysis.region)
+        graph.build_graph_from_sites(sites)
+
+        node_dict = {}
+        for idx, node_info in graph.nodes.items():
+            member = next((m for m in members if m.site_id == node_info.get('id')), None)
+            node_dict[idx] = {
+                **node_info,
+                'role': member.node_role if member else '终端节点',
+            }
+
+        graph_data = {
+            'edges': [dict(e) for e in graph.edges],
+            'nodes': node_dict,
+        }
+
+        for corr in corrections:
+            corr['expert_id'] = expert_id
+
+        completor = _completor_store.get(analysis.region)
+        if not completor:
+            completor = HydrologicalNetworkCompletor(analysis.region)
+            _completor_store[analysis.region] = completor
+
+        result = completor.apply_expert_correction(graph_data, corrections)
+
+        if analysis_id not in _audit_log_store:
+            _audit_log_store[analysis_id] = []
+        _audit_log_store[analysis_id].extend(result['audit_log'])
+
+        return {
+            "analysis_id": analysis_id,
+            "correction_count": len(corrections),
+            "audit_log": result['audit_log'],
+            "corrected_graph_summary": {
+                "total_edges": len(result['graph']['edges']),
+                "total_nodes": len(result['graph']['nodes']),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"应用专家修正失败 analysis_id={analysis_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"应用专家修正失败: {str(e)}")
+
+
+@router.get("/{analysis_id}/uncertainty")
+def get_network_uncertainty(
+    analysis_id: int,
+    db: Session = Depends(get_db)
+):
+    """不确定性分析：各指标P5/P50/P95区间、节点角色概率分布、置信度报告"""
+    analysis = db.query(HydraulicNetworkAnalysis).filter(
+        HydraulicNetworkAnalysis.id == analysis_id
+    ).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+
+    try:
+        members = db.query(NetworkMemberSite).filter(
+            NetworkMemberSite.network_analysis_id == analysis_id
+        ).all()
+        site_ids = [m.site_id for m in members]
+        sites = db.query(WaterHeritageSite).filter(
+            WaterHeritageSite.id.in_(site_ids)
+        ).all() if site_ids else []
+
+        graph = HydraulicNetworkGraph(analysis.region)
+        graph.build_graph_from_sites(sites)
+
+        analyzer = UncertaintyAwareNetworkAnalyzer(graph)
+        mc_result = analyzer.monte_carlo_network_sampling(n_samples=200, seed=42)
+        robustness = analyzer.calculate_robustness_metrics(mc_result)
+        node_role_probs = analyzer.propagate_edge_uncertainty_to_node_roles()
+        confidence_report = analyzer.generate_completion_confidence_report()
+
+        def _extract_interval(metric_data: Dict) -> Dict:
+            return {
+                "p5": metric_data.get("p5"),
+                "p50": metric_data.get("p50"),
+                "p95": metric_data.get("p95"),
+                "mean": metric_data.get("mean"),
+                "std": metric_data.get("std"),
+            }
+
+        return {
+            "analysis_id": analysis_id,
+            "metric_intervals": {
+                "connectivity": _extract_interval(mc_result.get("connectivity", {})),
+                "redundancy": _extract_interval(mc_result.get("redundancy", {})),
+                "cascade_efficiency": _extract_interval(mc_result.get("cascade_efficiency", {})),
+                "synergy_score": _extract_interval(mc_result.get("synergy_score", {})),
+            },
+            "node_role_probabilities": node_role_probs,
+            "robustness_metrics": robustness,
+            "confidence_report": {
+                "edge_source_distribution": confidence_report.get("edge_source_distribution", {}),
+                "low_confidence_edge_count": confidence_report.get("low_confidence_edge_count", 0),
+                "questionable_node_count": confidence_report.get("questionable_node_count", 0),
+                "metric_reliability": confidence_report.get("metric_reliability", {}),
+                "recommendations": confidence_report.get("recommendations", []),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取不确定性分析失败 analysis_id={analysis_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"获取不确定性分析失败: {str(e)}")
+
+
+@router.post("/{analysis_id}/monte-carlo")
+def run_monte_carlo_sampling(
+    analysis_id: int,
+    request_body: Dict[str, Any],
+    db: Session = Depends(get_db)
+):
+    """运行指定数量的蒙特卡洛采样，返回详细分布数据"""
+    analysis = db.query(HydraulicNetworkAnalysis).filter(
+        HydraulicNetworkAnalysis.id == analysis_id
+    ).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+
+    n_samples = int(request_body.get("n_samples", 200))
+    seed = int(request_body.get("seed", 42))
+
+    if n_samples < 10:
+        raise HTTPException(status_code=400, detail="n_samples 至少为 10")
+    if n_samples > 2000:
+        raise HTTPException(status_code=400, detail="n_samples 最多为 2000")
+
+    try:
+        members = db.query(NetworkMemberSite).filter(
+            NetworkMemberSite.network_analysis_id == analysis_id
+        ).all()
+        site_ids = [m.site_id for m in members]
+        sites = db.query(WaterHeritageSite).filter(
+            WaterHeritageSite.id.in_(site_ids)
+        ).all() if site_ids else []
+
+        graph = HydraulicNetworkGraph(analysis.region)
+        graph.build_graph_from_sites(sites)
+
+        analyzer = UncertaintyAwareNetworkAnalyzer(graph)
+        mc_result = analyzer.monte_carlo_network_sampling(n_samples=n_samples, seed=seed)
+        robustness = analyzer.calculate_robustness_metrics(mc_result)
+
+        samples_detail = {}
+        for metric in ['connectivity', 'redundancy', 'cascade_efficiency', 'synergy_score']:
+            data = mc_result.get(metric, {})
+            samples_detail[metric] = {
+                "mean": data.get("mean"),
+                "std": data.get("std"),
+                "p5": data.get("p5"),
+                "p50": data.get("p50"),
+                "p95": data.get("p95"),
+                "samples": data.get("samples", [])[:100],
+                "sample_count": len(data.get("samples", [])),
+            }
+
+        return {
+            "analysis_id": analysis_id,
+            "n_samples": n_samples,
+            "seed": seed,
+            "samples_detail": samples_detail,
+            "robustness_metrics": robustness,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"蒙特卡洛采样失败 analysis_id={analysis_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"蒙特卡洛采样失败: {str(e)}")
+
+
+@router.get("/{analysis_id}/audit-log")
+def get_analysis_audit_log(
+    analysis_id: int,
+    db: Session = Depends(get_db)
+):
+    """返回专家修正的完整审计轨迹（含专家ID、时间、理由、置信度）"""
+    analysis = db.query(HydraulicNetworkAnalysis).filter(
+        HydraulicNetworkAnalysis.id == analysis_id
+    ).first()
+    if not analysis:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+
+    audit_log = _audit_log_store.get(analysis_id, [])
+
+    return {
+        "analysis_id": analysis_id,
+        "region": analysis.region,
+        "total_corrections": len(audit_log),
+        "audit_log": audit_log,
+    }
+
+
+@router.get("/regions/{region}/completion-quality")
+def get_completion_quality(
+    region: str,
+    db: Session = Depends(get_db)
+):
+    """返回补全质量评估结果（密度变化率、补后边占比等）"""
+    if region not in REGIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"无效区域: {region}，有效区域为: {', '.join(REGIONS)}"
+        )
+
+    try:
+        sites = _analyzer_service._load_sites_in_region(db, region)
+        if not sites or len(sites) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail=f"区域 {region} 内遗址数量不足（至少需要2个）"
+            )
+
+        original_graph = HydraulicNetworkGraph(region)
+        original_graph.build_graph_from_sites(sites)
+        original_data = {
+            'edges': [dict(e) for e in original_graph.edges],
+            'nodes': dict(original_graph.nodes),
+        }
+
+        completor = _completor_store.get(region)
+        if not completor:
+            completor = HydrologicalNetworkCompletor(region)
+            _completor_store[region] = completor
+
+        prior_network = completor.build_hydrological_prior_network(region, sites)
+        completed_data = {
+            'edges': prior_network['edges'],
+            'nodes': prior_network['node_metadata'],
+        }
+
+        quality = completor.evaluate_completion_quality(original_data, completed_data)
+
+        return {
+            "region": region,
+            "total_sites": len(sites),
+            "quality_metrics": quality,
+            "node_metadata_summary": {
+                "inferred_river_node_count": sum(
+                    1 for m in prior_network['node_metadata'].values()
+                    if m.get('inferred_river')
+                ),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取补全质量评估失败 region={region}: {e}")
+        raise HTTPException(status_code=500, detail=f"获取补全质量评估失败: {str(e)}")
 
 
 app.include_router(router)

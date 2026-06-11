@@ -36,6 +36,12 @@ from .reconstruction_engine import (
     RECONSTRUCTION_METHODS,
     RECONSTRUCTION_STAGES,
 )
+from .mvr_deep_enhance import (
+    MultiViewReconstructionFusionEngine,
+    DeepLearningImageEnhancer,
+    QualityGuaranteedReconstructor,
+    EnhanceStrategy,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("digital_exhibit")
@@ -51,6 +57,9 @@ app = FastAPI(
 router = APIRouter(prefix="/api/v1/digital")
 
 _pipeline = DigitalReconstructionPipeline()
+_mvr_engine = MultiViewReconstructionFusionEngine()
+_enhancer = DeepLearningImageEnhancer()
+_guaranteed_reconstructor = QualityGuaranteedReconstructor()
 
 
 # ==============================================
@@ -883,6 +892,535 @@ def get_digital_stats(db: Session = Depends(get_db)):
         "texture_resolution_distribution": tex_dist,
         "avg_reconstruction_duration_sec": avg_duration,
         "by_dynasty_distribution": dynasty_dist,
+    }
+
+
+# ==============================================
+# 照片质量深度评估与增强 API
+# ==============================================
+
+class PhotoQualityRequest(BaseModel):
+    photo_urls: List[str] = Field(..., description="照片URL列表")
+
+
+class EnhancePhotosRequest(BaseModel):
+    photo_urls: List[str] = Field(..., description="照片URL列表")
+    enhance_strategy: str = Field("auto", description="增强策略: auto|denoise|sr|full")
+
+
+class GuaranteedReconstructionRequest(BaseModel):
+    photo_urls: List[str] = Field(..., description="照片URL列表")
+    method: str = Field("摄影测量", description="重建方法")
+    min_quality_threshold: int = Field(60, ge=0, le=100, description="最低质量阈值")
+    generate_vr: bool = Field(True, description="是否生成VR体验")
+
+
+@router.get("/sites/{site_id}/photo-quality")
+def get_photo_quality_report(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    recon = db.query(DigitalReconstruction).filter(
+        DigitalReconstruction.site_id == site_id
+    ).first()
+
+    photo_urls: List[str] = []
+    if recon and recon.model_metadata:
+        stages = recon.model_metadata.get("stages", {})
+        preprocessing = stages.get("photo_preprocessing", {})
+        photo_meta = preprocessing.get("photo_meta", [])
+        photo_urls = [p.get("url", "") for p in photo_meta if p.get("url")]
+
+    if not photo_urls:
+        raise HTTPException(status_code=404, detail="未找到该遗址的照片数据，请先上传照片并触发重建")
+
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(photo_urls)]
+
+    per_photo_quality: List[Dict[str, Any]] = []
+    issue_statistics: Dict[str, int] = {
+        "噪声": 0, "模糊": 0, "光照不均": 0, "低分辨率": 0
+    }
+    quality_scores: List[float] = []
+
+    recommended_strategies = _enhancer.adaptive_enhancement_strategy(photos)
+
+    for idx, photo in enumerate(photos):
+        qm = _mvr_engine.evaluate_image_quality_metrics(photo)
+        quality_scores.append(qm["overall_score"])
+
+        for issue in qm["specific_issues"]:
+            if issue in issue_statistics:
+                issue_statistics[issue] += 1
+
+        photo_id = photo.get("id", photo.get("url", f"photo_{idx}"))
+        per_photo_quality.append({
+            "photo_index": idx,
+            "photo_url": photo.get("url"),
+            "photo_id": photo_id,
+            "quality_metrics": qm,
+            "recommended_enhance_steps": recommended_strategies.get(photo_id, ["skip"]),
+        })
+
+    avg_quality = round(sum(quality_scores) / max(1, len(quality_scores)), 2)
+    min_quality = round(min(quality_scores) if quality_scores else 0.0, 2)
+    max_quality = round(max(quality_scores) if quality_scores else 0.0, 2)
+    low_quality_count = sum(1 for s in quality_scores if s < 60)
+
+    overall_diagnosis: List[str] = []
+    if avg_quality < 60:
+        overall_diagnosis.append("整体照片质量较差，强烈建议进行深度学习增强或重新拍摄")
+    elif avg_quality < 75:
+        overall_diagnosis.append("整体照片质量一般，建议进行选择性增强")
+    else:
+        overall_diagnosis.append("整体照片质量良好")
+
+    if low_quality_count > len(quality_scores) * 0.3:
+        overall_diagnosis.append(f"低质量照片比例过高（{low_quality_count}/{len(quality_scores)}），建议重新拍摄关键视角")
+
+    common_issues = [k for k, v in issue_statistics.items() if v > len(quality_scores) * 0.3]
+    if common_issues:
+        overall_diagnosis.append(f"常见问题：{', '.join(common_issues)}")
+
+    return {
+        "site_id": site_id,
+        "site_name": site.name,
+        "total_photos": len(photos),
+        "quality_statistics": {
+            "avg_overall_score": avg_quality,
+            "min_score": min_quality,
+            "max_score": max_quality,
+            "low_quality_count": low_quality_count,
+            "low_quality_ratio": round(low_quality_count / max(1, len(quality_scores)), 4),
+        },
+        "issue_statistics": issue_statistics,
+        "per_photo_quality": per_photo_quality,
+        "overall_diagnosis": overall_diagnosis,
+    }
+
+
+@router.post("/sites/{site_id}/enhance-photos")
+def enhance_site_photos(
+    site_id: int,
+    request: EnhancePhotosRequest,
+    db: Session = Depends(get_db)
+):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    if not request.photo_urls:
+        raise HTTPException(status_code=400, detail="photo_urls不能为空")
+
+    valid_strategies = ["auto", "denoise", "sr", "full"]
+    if request.enhance_strategy not in valid_strategies:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的增强策略: {request.enhance_strategy}, 有效策略: {valid_strategies}"
+        )
+
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(request.photo_urls)]
+
+    if request.enhance_strategy == "full":
+        skip_threshold = 101.0
+    elif request.enhance_strategy == "denoise":
+        for p in photos:
+            p["force_denoise"] = True
+        skip_threshold = 101.0
+    elif request.enhance_strategy == "sr":
+        for p in photos:
+            p["force_sr"] = True
+        skip_threshold = 101.0
+    else:
+        skip_threshold = 70.0
+
+    result = _enhancer.run_full_enhancement_pipeline(photos, skip_if_quality_threshold=skip_threshold)
+
+    enhanced_photo_urls: List[Dict[str, Any]] = []
+    for idx, ep in enumerate(result["enhanced_photos"]):
+        enhanced_photo_urls.append({
+            "original_url": ep.get("url", request.photo_urls[idx] if idx < len(request.photo_urls) else ""),
+            "enhanced_url": ep.get("enhanced_url", ""),
+            "enhanced": ep.get("enhanced", False),
+            "quality_before": ep.get("quality_before"),
+            "quality_after": ep.get("quality_before", 0) + (
+                result["pipeline_log"][idx].get("quality_improvement", 0)
+                if idx < len(result["pipeline_log"]) else 0
+            ),
+        })
+
+    quality_improvement = result["overall_quality_improvement"]
+
+    return {
+        "site_id": site_id,
+        "site_name": site.name,
+        "enhance_strategy": request.enhance_strategy,
+        "total_photos": len(request.photo_urls),
+        "enhanced_count": quality_improvement["enhanced_count"],
+        "enhanced_photo_urls": enhanced_photo_urls,
+        "quality_improvement": quality_improvement,
+        "pipeline_log": result["pipeline_log"],
+        "message": f"照片增强完成，共增强 {quality_improvement['enhanced_count']} 张照片",
+    }
+
+
+@router.get("/sites/{site_id}/view-coverage")
+def get_view_coverage(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    recon = db.query(DigitalReconstruction).filter(
+        DigitalReconstruction.site_id == site_id
+    ).first()
+
+    photo_urls: List[str] = []
+    if recon and recon.model_metadata:
+        stages = recon.model_metadata.get("stages", {})
+        preprocessing = stages.get("photo_preprocessing", {})
+        photo_meta = preprocessing.get("photo_meta", [])
+        photo_urls = [p.get("url", "") for p in photo_meta if p.get("url")]
+
+    if not photo_urls:
+        raise HTTPException(status_code=404, detail="未找到该遗址的照片数据")
+
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(photo_urls)]
+
+    cluster_result = _mvr_engine.cluster_photo_viewpoints(photos)
+
+    coverage_score = cluster_result["coverage_score"]
+    recommendations: List[str] = []
+    missing_view_angles: List[float] = []
+
+    if coverage_score < 60:
+        recommendations.append("视角覆盖度严重不足，建议大幅补充拍摄角度")
+    elif coverage_score < 75:
+        recommendations.append("视角覆盖度偏低，建议补充部分缺失视角")
+    elif coverage_score < 85:
+        recommendations.append("视角覆盖度一般，可选择性补充视角以提升质量")
+    else:
+        recommendations.append("视角覆盖度良好")
+
+    viewpoint_features = cluster_result.get("viewpoint_features", [])
+    if viewpoint_features:
+        azimuths = sorted([vf["azimuth_deg"] for vf in viewpoint_features])
+        gaps = []
+        for i in range(len(azimuths)):
+            next_i = (i + 1) % len(azimuths)
+            gap = (azimuths[next_i] - azimuths[i]) % 360.0
+            if gap > 45.0:
+                mid_angle = (azimuths[i] + gap / 2.0) % 360.0
+                gaps.append({
+                    "start_angle": azimuths[i],
+                    "end_angle": azimuths[next_i],
+                    "gap_size_deg": round(gap, 2),
+                    "suggested_shoot_angle": round(mid_angle, 2),
+                })
+                missing_view_angles.append(round(mid_angle, 2))
+
+        if gaps:
+            recommendations.append(
+                f"建议在以下方位角补拍: {', '.join([str(g['suggested_shoot_angle']) + '°' for g in gaps[:5]])}"
+            )
+            if len(gaps) > 5:
+                recommendations.append(f"还有 {len(gaps) - 5} 处较大视角间隙建议补充")
+
+    clusters_detail = []
+    for cluster_idx, cluster in enumerate(cluster_result["clusters"]):
+        cluster_photos = []
+        for photo_idx in cluster:
+            if photo_idx < len(photos):
+                cluster_photos.append({
+                    "photo_index": photo_idx,
+                    "photo_url": photos[photo_idx].get("url", ""),
+                })
+        clusters_detail.append({
+            "cluster_id": cluster_idx,
+            "photo_count": len(cluster),
+            "photos": cluster_photos,
+        })
+
+    return {
+        "site_id": site_id,
+        "site_name": site.name,
+        "total_photos": len(photos),
+        "coverage_score": coverage_score,
+        "coverage_grade": _guaranteed_reconstructor._grade_quality(coverage_score),
+        "cluster_count": cluster_result["cluster_count"],
+        "clusters": clusters_detail,
+        "viewpoint_features": viewpoint_features,
+        "gaps": gaps if 'gaps' in locals() else [],
+        "missing_view_angles": missing_view_angles,
+        "recommendations": recommendations,
+    }
+
+
+@router.post("/sites/{site_id}/reconstruct-guaranteed")
+def reconstruct_site_guaranteed(
+    site_id: int,
+    request: GuaranteedReconstructionRequest,
+    db: Session = Depends(get_db)
+):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    if not request.photo_urls:
+        raise HTTPException(status_code=400, detail="photo_urls不能为空")
+
+    if request.method not in RECONSTRUCTION_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的重建方法: {request.method}, 有效方法: {list(RECONSTRUCTION_METHODS.keys())}"
+        )
+
+    min_photos = RECONSTRUCTION_METHODS[request.method]["params"]["min_photos"]
+    if len(request.photo_urls) < min_photos:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{request.method}至少需要{min_photos}张照片，当前{len(request.photo_urls)}张"
+        )
+
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(request.photo_urls)]
+
+    try:
+        result = _guaranteed_reconstructor.run_guaranteed_reconstruction(
+            site_id=site_id,
+            photos=photos,
+            method=request.method,
+            generate_vr=request.generate_vr,
+            min_quality_threshold=float(request.min_quality_threshold),
+        )
+
+        quality = result["quality_assessment"]
+        status = "quality_passed" if quality["pass_fail"] else "quality_warning"
+
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "status": status,
+            "method": request.method,
+            "generate_vr": request.generate_vr,
+            "min_quality_threshold": request.min_quality_threshold,
+            "reconstruction": result["reconstruction"],
+            "quality_assessment": quality,
+            "warnings": result["warnings"],
+            "recommendations": result["recommendations"],
+            "message": "质量保证重建完成" if quality["pass_fail"] else "重建完成但质量未达阈值，建议参考改进建议",
+        }
+    except Exception as e:
+        logger.error(f"质量保证重建失败 site_id={site_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"质量保证重建失败: {str(e)}")
+
+
+@router.get("/sites/{site_id}/quality-assessment")
+def get_reconstruction_quality_assessment(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    recon = db.query(DigitalReconstruction).filter(
+        DigitalReconstruction.site_id == site_id
+    ).first()
+
+    if not recon or recon.reconstruction_status != "已完成":
+        raise HTTPException(status_code=404, detail="重建未完成或不存在")
+
+    metadata = recon.model_metadata or {}
+    stages = metadata.get("stages", {})
+
+    photo_meta: List[Dict[str, Any]] = []
+    preprocessing = stages.get("photo_preprocessing", {})
+    if isinstance(preprocessing, dict):
+        photo_meta = preprocessing.get("photo_meta", [])
+    photo_urls = [p.get("url", "") for p in photo_meta if p.get("url")]
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(photo_urls)]
+
+    dense_info = stages.get("dense_reconstruction", {})
+    mesh_info = stages.get("mesh_generation", {})
+    texture_info = stages.get("texture_baking", {})
+
+    simulated_reconstruction = {
+        "site_id": site_id,
+        "method": recon.reconstruction_method,
+        "generate_vr": recon.vr_experience_url is not None,
+        "dense_point_cloud": {
+            "point_count": recon.point_cloud_count or dense_info.get("dense_points_count", 0),
+            "density_pts_per_m2": dense_info.get("average_point_density_pts_per_m2", 5000),
+        },
+        "mesh": {
+            "face_count": recon.mesh_face_count or mesh_info.get("mesh_face_count", 0),
+            "vertex_count": mesh_info.get("mesh_vertex_count", 0),
+            "quality_score": mesh_info.get("mesh_quality_score", 0.7),
+            "watertight": mesh_info.get("watertight", False),
+            "method": mesh_info.get("method", "poisson"),
+        },
+        "texture": {
+            "resolution": recon.texture_resolution or texture_info.get("texture_resolution", "2K"),
+            "blend_quality": texture_info.get("texture_blend_quality", 0.7),
+        },
+        "coverage_score": 75.0,
+        "fusion_quality_score": 0.75,
+        "input_photo_count": recon.photos_uploaded_count or len(photos),
+        "selected_photo_count": len(photos),
+        "synthetic_view_count": 0,
+        "avg_input_quality_before": 65.0,
+        "avg_input_quality_after_enhance": 75.0,
+    }
+
+    quality_assessment = _guaranteed_reconstructor.assess_reconstruction_quality(
+        simulated_reconstruction, photos
+    )
+
+    return {
+        "site_id": site_id,
+        "site_name": site.name,
+        "reconstruction_id": recon.id,
+        "reconstruction_method": recon.reconstruction_method,
+        "reconstruction_status": recon.reconstruction_status,
+        "quality_assessment": quality_assessment,
+        "detailed_metrics": {
+            "point_cloud_count": recon.point_cloud_count,
+            "mesh_face_count": recon.mesh_face_count,
+            "texture_resolution": recon.texture_resolution,
+            "mesh_quality_score": mesh_info.get("mesh_quality_score"),
+            "texture_blend_quality": texture_info.get("texture_blend_quality"),
+            "point_density": dense_info.get("average_point_density_pts_per_m2"),
+        },
+    }
+
+
+@router.get("/sites/{site_id}/recommendation")
+def get_site_improvement_recommendations(site_id: int, db: Session = Depends(get_db)):
+    site = db.query(WaterHeritageSite).filter(WaterHeritageSite.id == site_id).first()
+    if not site:
+        raise HTTPException(status_code=404, detail="遗迹不存在")
+
+    recon = db.query(DigitalReconstruction).filter(
+        DigitalReconstruction.site_id == site_id
+    ).first()
+
+    photo_urls: List[str] = []
+    if recon and recon.model_metadata:
+        stages = recon.model_metadata.get("stages", {})
+        preprocessing = stages.get("photo_preprocessing", {})
+        photo_meta = preprocessing.get("photo_meta", []) if isinstance(preprocessing, dict) else []
+        photo_urls = [p.get("url", "") for p in photo_meta if p.get("url")]
+
+    if not photo_urls:
+        return {
+            "site_id": site_id,
+            "site_name": site.name,
+            "has_photos": False,
+            "recommendations": [
+                "请先上传至少5张不同角度的遗址照片",
+                "建议使用分辨率不低于1920x1080的相机拍摄",
+                "拍摄时注意保持光照均匀，避免过曝或过暗",
+                "建议环绕遗址每隔15-30度拍摄一张照片",
+            ],
+            "photos_to_enhance": [],
+            "angles_to_reshoot": [],
+        }
+
+    photos = [{"url": url, "id": f"photo_{i}"} for i, url in enumerate(photo_urls)]
+
+    quality_list: List[Dict[str, Any]] = []
+    for idx, photo in enumerate(photos):
+        qm = _mvr_engine.evaluate_image_quality_metrics(photo)
+        quality_list.append({
+            "photo_index": idx,
+            "photo_url": photo.get("url"),
+            "quality_metrics": qm,
+        })
+
+    cluster_result = _mvr_engine.cluster_photo_viewpoints(photos)
+
+    strategies = _enhancer.adaptive_enhancement_strategy(photos)
+
+    photos_to_enhance: List[Dict[str, Any]] = []
+    for q in quality_list:
+        qm = q["quality_metrics"]
+        if qm["enhance_needed"] or qm["overall_score"] < 75:
+            photo_id = photos[q["photo_index"]].get("id", photos[q["photo_index"]].get("url"))
+            photos_to_enhance.append({
+                "photo_index": q["photo_index"],
+                "photo_url": q["photo_url"],
+                "overall_score": qm["overall_score"],
+                "issues": qm["specific_issues"],
+                "recommended_steps": strategies.get(photo_id, ["auto"]),
+                "priority": "high" if qm["overall_score"] < 50 else "medium",
+            })
+
+    angles_to_reshoot: List[Dict[str, Any]] = []
+    viewpoint_features = cluster_result.get("viewpoint_features", [])
+    if viewpoint_features:
+        azimuths = sorted([vf["azimuth_deg"] for vf in viewpoint_features])
+        for i in range(len(azimuths)):
+            next_i = (i + 1) % len(azimuths)
+            gap = (azimuths[next_i] - azimuths[i]) % 360.0
+            if gap > 50.0:
+                mid_angle = (azimuths[i] + gap / 2.0) % 360.0
+                angles_to_reshoot.append({
+                    "suggested_azimuth_deg": round(mid_angle, 2),
+                    "gap_size_deg": round(gap, 2),
+                    "priority": "high" if gap > 80 else "medium",
+                    "suggestion": f"建议在方位角 {round(mid_angle, 1)}° 方向补拍2-3张照片",
+                })
+
+    recommendations: List[str] = []
+
+    low_quality_count = sum(1 for q in quality_list if q["quality_metrics"]["overall_score"] < 60)
+    if low_quality_count > 0:
+        recommendations.append(
+            f"有 {low_quality_count} 张照片质量低于阈值，建议先进行增强处理或重新拍摄"
+        )
+
+    if cluster_result["coverage_score"] < 75:
+        recommendations.append(
+            f"当前视角覆盖度 {cluster_result['coverage_score']:.1f}/100，建议补充缺失视角"
+        )
+
+    if photos_to_enhance:
+        high_priority = [p for p in photos_to_enhance if p["priority"] == "high"]
+        if high_priority:
+            recommendations.append(
+                f"有 {len(high_priority)} 张高优先级照片需要增强"
+            )
+
+    if angles_to_reshoot:
+        high_priority_angles = [a for a in angles_to_reshoot if a["priority"] == "high"]
+        if high_priority_angles:
+            recommendations.append(
+                f"有 {len(high_priority_angles)} 处大视角间隙需要补拍"
+            )
+
+    if recon and recon.reconstruction_status == "已完成":
+        metadata = recon.model_metadata or {}
+        stages = metadata.get("stages", {})
+        mesh_info = stages.get("mesh_generation", {})
+        if isinstance(mesh_info, dict):
+            if not mesh_info.get("watertight", False):
+                recommendations.append("当前网格非封闭，建议补充更多视角照片以提升网格质量")
+            tex_info = stages.get("texture_baking", {})
+            if isinstance(tex_info, dict) and tex_info.get("texture_resolution") in ("1K",):
+                recommendations.append("当前纹理分辨率较低，建议使用更高分辨率原始照片重新重建")
+
+    if not recommendations:
+        recommendations.append("当前数字化质量良好，暂无特殊改进建议")
+
+    return {
+        "site_id": site_id,
+        "site_name": site.name,
+        "has_photos": True,
+        "total_photos": len(photos),
+        "current_coverage_score": cluster_result["coverage_score"],
+        "avg_photo_quality": round(
+            sum(q["quality_metrics"]["overall_score"] for q in quality_list) / max(1, len(quality_list)), 2
+        ),
+        "recommendations": recommendations,
+        "photos_to_enhance": photos_to_enhance,
+        "angles_to_reshoot": angles_to_reshoot,
+        "enhancement_strategies": strategies,
     }
 
 
