@@ -1,0 +1,54 @@
+/**
+ * 网络效应图层组件 - 样式
+ * 样式前缀：net-effect-
+ */
+
+.net-effect-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.net-effect-popup {
+    position: absolute;
+    z-index: 1001;
+    background: rgba(26, 32, 44, 0.96);
+    color: white;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.7;
+    pointer-events: none;
+    display: none;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    max-width: 260px;
+}
+
+.net-effect-context-menu {
+    position: absolute;
+    z-index: 1002;
+    background: white;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+    padding: 4px 0;
+    font-size: 12px;
+    min-width: 180px;
+    display: none;
+    border: 1px solid #e2e8f0;
+}
+
+.net-effect-context-menu .ctx-item {
+    padding: 6px 14px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.net-effect-context-menu .ctx-item:hover {
+    background: #edf2f7;
+}
