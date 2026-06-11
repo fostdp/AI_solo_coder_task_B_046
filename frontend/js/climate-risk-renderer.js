@@ -1,0 +1,646 @@
+/**
+ * 气候风险区渲染器 v1.0
+ *
+ * 特性：
+ * - Canvas批量绘制气候风险区多边形
+ * - 多情景切换（RCP2.6/RCP4.5/RCP8.5）和年份切换（2030/2050/2070/2100）
+ * - 风险等级颜色映射（绿→红）
+ * - 高/极高风险区呼吸动画（requestAnimationFrame脉冲）
+ * - 不同填充模式（虚线、点线、渐变）
+ * - 视口裁剪、LOD简化、80ms debounce、DPR适配
+ */
+
+class ClimateRiskRenderer {
+    constructor(map, options = {}) {
+        this.map = map;
+        this.options = Object.assign({
+            cellSize: 50,
+            maxVisibleZones: 300,
+            simplifyToleranceBase: 0.0001,
+            throttleMs: 80,
+            riskLevels: {
+                1: { name: '低风险', color: [56, 161, 105], pattern: 'solid', alpha: 0.18 },
+                2: { name: '较低风险', color: [104, 159, 56], pattern: 'dotted', alpha: 0.22 },
+                3: { name: '中风险', color: [214, 158, 46], pattern: 'dashed', alpha: 0.26 },
+                4: { name: '高风险', color: [237, 137, 54], pattern: 'gradient', alpha: 0.30 },
+                5: { name: '极高风险', color: [229, 62, 62], pattern: 'gradient', alpha: 0.35 }
+            },
+            strokeWidth: 1.2,
+            breathePeriod: 2000
+        }, options);
+
+        this.allZones = {};
+        this.currentZones = [];
+        this.currentScenario = 'RCP4.5';
+        this.currentYear = 2050;
+        this.spatialIndex = null;
+        this.visibleZones = [];
+        this.hoveredId = null;
+        this.selectedSiteId = null;
+        this._renderThrottled = null;
+        this._animationFrame = null;
+        this._animationStart = 0;
+        this._popupEl = null;
+        this._controlsEl = null;
+        this._breathePhase = 0;
+        this._running = false;
+
+        this._initCanvas();
+        this._initPopup();
+        this._initControls();
+        this._initEvents();
+    }
+
+    _initCanvas() {
+        this.canvas = document.createElement('canvas');
+        this.canvas.style.position = 'absolute';
+        this.canvas.style.top = '0';
+        this.canvas.style.left = '0';
+        this.canvas.style.pointerEvents = 'none';
+        this.canvas.style.zIndex = 400;
+
+        this.overlay = L.DomUtil.create('div', 'climate-risk-overlay');
+        this.overlay.style.position = 'absolute';
+        this.overlay.style.top = '0';
+        this.overlay.style.left = '0';
+        this.overlay.style.width = '100%';
+        this.overlay.style.height = '100%';
+        this.overlay.style.pointerEvents = 'none';
+        this.overlay.appendChild(this.canvas);
+
+        this._pane = this.map.getPane('overlayPane');
+        this._pane.appendChild(this.overlay);
+
+        this.ctx = this.canvas.getContext('2d');
+        this._resize();
+    }
+
+    _initPopup() {
+        this._popupEl = document.createElement('div');
+        this._popupEl.className = 'climate-risk-popup';
+        this._popupEl.style.cssText = `
+            position: absolute;
+            z-index: 999;
+            background: rgba(26, 32, 44, 0.96);
+            color: white;
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            line-height: 1.7;
+            pointer-events: none;
+            display: none;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+            border: 1px solid rgba(255,255,255,0.12);
+            max-width: 280px;
+        `;
+        this.map.getContainer().appendChild(this._popupEl);
+    }
+
+    _initControls() {
+        this._controlsEl = document.createElement('div');
+        this._controlsEl.className = 'climate-risk-controls';
+        this._controlsEl.style.cssText = `
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            z-index: 1000;
+            background: rgba(255, 255, 255, 0.97);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-size: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+            display: none;
+        `;
+        this._controlsEl.innerHTML = `
+            <div style="font-weight:600;margin-bottom:8px;color:#2d3748;">气候风险情景</div>
+            <div style="margin-bottom:6px;">
+                <label style="display:inline-block;width:52px;color:#4a5568;">情景:</label>
+                <select class="risk-scenario-select" style="padding:3px 6px;border:1px solid #cbd5e0;border-radius:4px;font-size:12px;">
+                    <option value="RCP2.6">RCP2.6 (低排放)</option>
+                    <option value="RCP4.5" selected>RCP4.5 (中低)</option>
+                    <option value="RCP8.5">RCP8.5 (高排放)</option>
+                </select>
+            </div>
+            <div>
+                <label style="display:inline-block;width:52px;color:#4a5568;">年份:</label>
+                <select class="risk-year-select" style="padding:3px 6px;border:1px solid #cbd5e0;border-radius:4px;font-size:12px;">
+                    <option value="2030">2030年</option>
+                    <option value="2050" selected>2050年</option>
+                    <option value="2070">2070年</option>
+                    <option value="2100">2100年</option>
+                </select>
+            </div>
+        `;
+        this.map.getContainer().appendChild(this._controlsEl);
+
+        const scenarioSel = this._controlsEl.querySelector('.risk-scenario-select');
+        const yearSel = this._controlsEl.querySelector('.risk-year-select');
+
+        scenarioSel.addEventListener('change', () => {
+            this.setScenario(scenarioSel.value, parseInt(yearSel.value));
+        });
+        yearSel.addEventListener('change', () => {
+            this.setScenario(scenarioSel.value, parseInt(yearSel.value));
+        });
+    }
+
+    _initEvents() {
+        this.map.on('move', () => this._throttleRender());
+        this.map.on('zoom', () => this._throttleRender());
+        this.map.on('moveend', () => this._onMoveEnd());
+        this.map.on('zoomend', () => this._onMoveEnd());
+        this.map.on('resize', () => {
+            this._resize();
+            this._render();
+        });
+
+        this.map.on('click', (e) => this._handleClick(e));
+        this.map.on('mousemove', (e) => this._handleMouseMove(e));
+        this.map.on('mouseout', () => this._hidePopup());
+
+        const debounced = (fn, wait) => {
+            let timer = null;
+            return (...args) => {
+                clearTimeout(timer);
+                timer = setTimeout(() => fn.apply(this, args), wait);
+            };
+        };
+
+        this._throttleRender = debounced(() => this._render(), this.options.throttleMs);
+    }
+
+    _resize() {
+        const size = this.map.getSize();
+        const dpr = window.devicePixelRatio || 1;
+        this.canvas.width = size.x * dpr;
+        this.canvas.height = size.y * dpr;
+        this.canvas.style.width = size.x + 'px';
+        this.canvas.style.height = size.y + 'px';
+        this.ctx.scale(dpr, dpr);
+        this._canvasWidth = size.x;
+        this._canvasHeight = size.y;
+    }
+
+    _startAnimation() {
+        if (this._running) return;
+        this._running = true;
+        this._animationStart = performance.now();
+        const loop = (now) => {
+            if (!this._running) return;
+            const elapsed = now - this._animationStart;
+            this._breathePhase = (Math.sin(elapsed / this.options.breathePeriod * Math.PI * 2) + 1) / 2;
+            this._render();
+            this._animationFrame = requestAnimationFrame(loop);
+        };
+        this._animationFrame = requestAnimationFrame(loop);
+    }
+
+    _stopAnimation() {
+        this._running = false;
+        if (this._animationFrame) {
+            cancelAnimationFrame(this._animationFrame);
+            this._animationFrame = null;
+        }
+    }
+
+    _hasHighRisk() {
+        return this.currentZones.some(z => this._isHighRisk(z));
+    }
+
+    _isHighRisk(zone) {
+        const lvl = zone.risk_level || zone.level || 0;
+        return lvl >= 4;
+    }
+
+    setRiskZones(zones, scenario = 'RCP4.5', year = 2050) {
+        this.currentScenario = scenario;
+        this.currentYear = year;
+
+        const key = `${scenario}_${year}`;
+        this.allZones[key] = (zones || []).map(z => ({
+            site_id: z.site_id,
+            site_name: z.site_name || ('遗址#' + z.site_id),
+            risk_level: z.risk_level || z.level || 1,
+            risk_name: z.risk_name,
+            vulnerability_score: z.vulnerability_score ?? z.score,
+            flood_depth: z.flood_depth,
+            drought_spei: z.drought_spei,
+            suggestions: z.suggestions || z.recommendations || [],
+            geom: this._extractGeom(z.geom || z.geometry || z),
+            properties: z.properties || {}
+        })).filter(z => z.geom.length > 0);
+
+        this.currentZones = this.allZones[key] || [];
+        this._buildSpatialIndex();
+
+        const scenarioSel = this._controlsEl?.querySelector('.risk-scenario-select');
+        const yearSel = this._controlsEl?.querySelector('.risk-year-select');
+        if (scenarioSel) scenarioSel.value = scenario;
+        if (yearSel) yearSel.value = String(year);
+
+        if (this._hasHighRisk()) {
+            this._startAnimation();
+        } else {
+            this._stopAnimation();
+        }
+
+        this._render();
+    }
+
+    setScenario(scenario, year) {
+        const key = `${scenario}_${year}`;
+        if (this.allZones[key]) {
+            this.currentZones = this.allZones[key];
+        }
+        this.currentScenario = scenario;
+        this.currentYear = year;
+        this._buildSpatialIndex();
+
+        if (this._hasHighRisk()) {
+            this._startAnimation();
+        } else {
+            this._stopAnimation();
+        }
+
+        this._render();
+    }
+
+    _extractGeom(geom) {
+        if (!geom) return [];
+        if (Array.isArray(geom) && geom.length > 0 && Array.isArray(geom[0])) {
+            if (Array.isArray(geom[0][0]) && Array.isArray(geom[0][0][0])) {
+                return geom[0][0];
+            }
+            if (Array.isArray(geom[0][0])) {
+                return geom[0];
+            }
+            if (typeof geom[0][0] === 'number') {
+                return geom;
+            }
+        }
+        if (geom.type === 'Polygon' && geom.coordinates) {
+            return geom.coordinates[0] || [];
+        }
+        if (geom.type === 'MultiPolygon' && geom.coordinates) {
+            return (geom.coordinates[0] && geom.coordinates[0][0]) ? geom.coordinates[0][0] : [];
+        }
+        if (geom.coordinates) {
+            const c = geom.coordinates;
+            if (Array.isArray(c[0]) && Array.isArray(c[0][0])) return c[0];
+            if (Array.isArray(c[0])) return c;
+            return c;
+        }
+        return [];
+    }
+
+    _buildSpatialIndex() {
+        this.spatialIndex = {
+            minLng: Infinity, maxLng: -Infinity,
+            minLat: Infinity, maxLat: -Infinity,
+            items: this.currentZones
+        };
+        for (const z of this.currentZones) {
+            for (const [lng, lat] of z.geom) {
+                if (lng < this.spatialIndex.minLng) this.spatialIndex.minLng = lng;
+                if (lng > this.spatialIndex.maxLng) this.spatialIndex.maxLng = lng;
+                if (lat < this.spatialIndex.minLat) this.spatialIndex.minLat = lat;
+                if (lat > this.spatialIndex.maxLat) this.spatialIndex.maxLat = lat;
+            }
+        }
+    }
+
+    _simplifyPolygon(coords, tolerance) {
+        if (coords.length <= 8) return coords;
+        return this._douglasPeucker(coords, tolerance);
+    }
+
+    _douglasPeucker(points, tolerance) {
+        if (points.length <= 2) return points;
+        const sqTolerance = tolerance * tolerance;
+        let maxDist = 0;
+        let maxIdx = 0;
+        const start = points[0];
+        const end = points[points.length - 1];
+        for (let i = 1; i < points.length - 1; i++) {
+            const d = this._perpendicularDistance(points[i], start, end);
+            if (d > maxDist) { maxDist = d; maxIdx = i; }
+        }
+        if (maxDist > sqTolerance) {
+            const left = this._douglasPeucker(points.slice(0, maxIdx + 1), tolerance);
+            const right = this._douglasPeucker(points.slice(maxIdx), tolerance);
+            return left.slice(0, -1).concat(right);
+        } else {
+            return [start, end];
+        }
+    }
+
+    _perpendicularDistance(p, start, end) {
+        const dx = end[0] - start[0];
+        const dy = end[1] - start[1];
+        const len = dx * dx + dy * dy;
+        if (len === 0) {
+            const dx1 = p[0] - start[0];
+            const dy1 = p[1] - start[1];
+            return dx1 * dx1 + dy1 * dy1;
+        }
+        const t = ((p[0] - start[0]) * dx + (p[1] - start[1]) * dy) / len;
+        const projX = start[0] + t * dx;
+        const projY = start[1] + t * dy;
+        const dx2 = p[0] - projX;
+        const dy2 = p[1] - projY;
+        return dx2 * dx2 + dy2 * dy2;
+    }
+
+    _getSimplifyTolerance() {
+        const zoom = this.map.getZoom();
+        const base = this.options.simplifyToleranceBase;
+        if (zoom < 6) return base * 8;
+        if (zoom < 8) return base * 4;
+        if (zoom < 10) return base * 2;
+        if (zoom < 12) return base;
+        return base * 0.5;
+    }
+
+    _polygonInViewport(coords, bounds) {
+        if (!coords || coords.length === 0) return false;
+        let minLng = Infinity, maxLng = -Infinity;
+        let minLat = Infinity, maxLat = -Infinity;
+        const step = Math.max(1, Math.floor(coords.length / 8));
+        for (let i = 0; i < coords.length; i += step) {
+            const [lng, lat] = coords[i];
+            if (lng < minLng) minLng = lng;
+            if (lng > maxLng) maxLng = lng;
+            if (lat < minLat) minLat = lat;
+            if (lat > maxLat) maxLat = lat;
+        }
+        return !(maxLng < bounds.getWest() || minLng > bounds.getEast() ||
+                 maxLat < bounds.getSouth() || minLat > bounds.getNorth());
+    }
+
+    _onMoveEnd() {
+        this._updateVisibleZones();
+        this._render();
+    }
+
+    _updateVisibleZones() {
+        const bounds = this.map.getBounds();
+        const tolerance = this._getSimplifyTolerance();
+        const zoom = this.map.getZoom();
+        this.visibleZones = [];
+        for (const zone of this.currentZones) {
+            if (!this._polygonInViewport(zone.geom, bounds)) continue;
+            let coords;
+            if (zoom < 8 && zone.geom.length > 12) {
+                coords = this._simplifyPolygon(zone.geom, tolerance);
+            } else {
+                coords = zone.geom;
+            }
+            const points = coords.map(([lng, lat]) => {
+                const p = this.map.latLngToContainerPoint([lat, lng]);
+                return [p.x, p.y];
+            });
+            this.visibleZones.push({
+                ...zone,
+                screenPoints: points
+            });
+            if (this.visibleZones.length >= this.options.maxVisibleZones) break;
+        }
+    }
+
+    _render() {
+        if (!this.ctx) return;
+        this._resize();
+        this.ctx.clearRect(0, 0, this._canvasWidth, this._canvasHeight);
+        if (!this.visibleZones || this.visibleZones.length === 0) {
+            this._updateVisibleZones();
+        }
+        const { ctx, options } = this;
+        const sorted = [...this.visibleZones].sort((a, b) => (a.risk_level || 1) - (b.risk_level || 1));
+        for (const zone of sorted) {
+            const isHovered = this.hoveredId === zone.site_id;
+            const isSelected = this.selectedSiteId === zone.site_id;
+            this._drawRiskZone(ctx, zone, isHovered, isSelected);
+        }
+    }
+
+    _drawRiskZone(ctx, zone, isHovered, isSelected) {
+        const { options } = this;
+        const level = zone.risk_level || 1;
+        const lvlInfo = options.riskLevels[level] || options.riskLevels[1];
+        const [r, g, b] = lvlInfo.color;
+        let alpha = lvlInfo.alpha;
+        const isHigh = this._isHighRisk(zone);
+        let breatheAdd = 0;
+        if (isHigh) {
+            breatheAdd = this._breathePhase * 0.18;
+        }
+        if (isHovered || isSelected) {
+            alpha = Math.min(0.6, alpha + 0.15);
+        }
+        const finalAlpha = Math.min(0.55, alpha + breatheAdd);
+        const pts = zone.screenPoints;
+        if (!pts || pts.length < 3) return;
+        const pattern = lvlInfo.pattern;
+        if (pattern === 'gradient') {
+            const cx = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+            const cy = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+            const maxDist = Math.sqrt(pts.reduce((s, p) => {
+                const dx = p[0] - cx, dy = p[1] - cy;
+                return s + dx * dx + dy * dy;
+            }, 0) / pts.length) || 50;
+            const gradient = ctx.createRadialGradient(cx, cy, maxDist * 0.1, cx, cy, maxDist);
+            gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${finalAlpha * 1.3})`);
+            gradient.addColorStop(0.6, `rgba(${r}, ${g}, ${b}, ${finalAlpha})`);
+            gradient.addColorStop(1, `rgba(${r * 0.85}, ${g * 0.85}, ${b * 0.85}, ${finalAlpha * 0.4})`);
+            ctx.fillStyle = gradient;
+        } else {
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${finalAlpha})`;
+        }
+        ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${isHovered ? 0.95 : (isHigh ? 0.65 + this._breathePhase * 0.3 : 0.55)})`;
+        ctx.lineWidth = (isHovered || isSelected) ? options.strokeWidth * 1.8 : options.strokeWidth;
+        if (pattern === 'dashed') {
+            ctx.setLineDash([6, 4]);
+        } else if (pattern === 'dotted') {
+            ctx.setLineDash([2, 3]);
+        } else {
+            ctx.setLineDash([]);
+        }
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) {
+            ctx.lineTo(pts[i][0], pts[i][1]);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (isHigh && this._running) {
+            ctx.save();
+            ctx.strokeStyle = `rgba(255, 255, 255, ${0.2 + this._breathePhase * 0.4})`;
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.moveTo(pts[0][0], pts[0][1]);
+            for (let i = 1; i < pts.length; i++) {
+                ctx.lineTo(pts[i][0], pts[i][1]);
+            }
+            ctx.closePath();
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
+
+    _handleClick(e) {
+        const clicked = this._hitTest(e.latlng);
+        if (clicked) {
+            this.selectedSiteId = clicked.site_id;
+            this._render();
+            if (this.options.onClick) {
+                this.options.onClick(clicked);
+            }
+        }
+    }
+
+    _handleMouseMove(e) {
+        const hovered = this._hitTest(e.latlng);
+        const newHoverId = hovered ? hovered.site_id : null;
+        if (newHoverId !== this.hoveredId) {
+            this.hoveredId = newHoverId;
+            this.overlay.style.cursor = hovered ? 'pointer' : '';
+            this._render();
+            if (hovered) {
+                this._showPopup(e.containerPoint, hovered);
+            } else {
+                    this._hidePopup();
+            }
+            if (this.options.onHover && hovered) {
+                this.options.onHover(hovered);
+            }
+        } else if (hovered) {
+            this._movePopup(e.containerPoint);
+        }
+    }
+
+    _showPopup(containerPoint, zone) {
+        if (!this._popupEl) return;
+        const lvlInfo = this.options.riskLevels[zone.risk_level || 1];
+        const scoreStr = zone.vulnerability_score !== undefined ? zone.vulnerability_score.toFixed(1) : '—';
+        const floodStr = zone.flood_depth !== undefined && zone.flood_depth !== null ? `${zone.flood_depth.toFixed(2)} m` : '—';
+        const speiStr = zone.drought_spei !== undefined && zone.drought_spei !== null ? zone.drought_spei.toFixed(2) : '—';
+        const sugHtml = (zone.suggestions && zone.suggestions.length > 0) ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.1);">
+            <div style="color:#a0aec0;margin-bottom:3px;">💡 防护建议:</div>
+            <ul style="margin:0;padding-left:16px;">
+                ${zone.suggestions.slice(0, 3).map(s => `<li>${escapeHtml(String(s))}</li>`).join('')}
+            </ul>
+        </div>` : '';
+
+        this._popupEl.innerHTML = `
+            <div style="font-weight:600;margin-bottom:6px;color:#fbd38d;font-size:13px;">${escapeHtml(zone.site_name)}</div>
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+                <span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:rgb(${lvlInfo.color[0]},${lvlInfo.color[1]},${lvlInfo.color[2]});"></span>
+                <span style="color:${lvlInfo.color[0] > 200 ? '#1a202c' : '#fff'};">${lvlInfo.name}</span>
+            </div>
+            <div style="color:#cbd5e0;">脆弱性分数: <span style="color:#fff;font-weight:600;">${scoreStr}</span></div>
+            <div style="color:#cbd5e0;">洪水深度: <span style="color:#fff;">${floodStr}</span></div>
+            <div style="color:#cbd5e0;">干旱SPEI: <span style="color:#fff;">${speiStr}</span></div>
+            ${sugHtml}
+        `;
+        this._movePopup(containerPoint);
+    }
+
+    _movePopup(containerPoint) {
+        if (!this._popupEl) return;
+        const mapContainer = this.map.getContainer();
+        const rect = mapContainer.getBoundingClientRect();
+        const x = containerPoint.x + 16;
+        const y = containerPoint.y - 10;
+        const popupWidth = this._popupEl.offsetWidth || 260;
+        const popupHeight = this._popupEl.offsetHeight || 100;
+        const finalX = Math.min(x, rect.width - popupWidth - 10);
+        const finalY = Math.max(10, Math.min(y, rect.height - popupHeight - 10));
+        this._popupEl.style.left = finalX + 'px';
+        this._popupEl.style.top = finalY + 'px';
+        this._popupEl.style.display = 'block';
+    }
+
+    _hidePopup() {
+        if (this._popupEl) {
+            this._popupEl.style.display = 'none';
+        }
+    }
+
+    _hitTest(latlng) {
+        const { lng, lat } = latlng;
+        const testPoint = [lng, lat];
+        for (const zone of this.visibleZones) {
+            if (zone.geom.length > 2 && this._pointInPolygon(testPoint, zone.geom)) {
+                return zone;
+            }
+        }
+        return null;
+    }
+
+    _pointInPolygon(point, polygon) {
+        const [px, py] = point;
+        let inside = false;
+        for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+            const [xi, yi] = polygon[i];
+            const [xj, yj] = polygon[j];
+            const intersect = ((yi > py) !== (yj > py)) &&
+                (px < (xj - xi) * (py - yi) / ((yj - yi) || 1e-9) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+
+    setSelected(siteId) {
+        this.selectedSiteId = siteId;
+        this._render();
+    }
+
+    clearSelected() {
+        this.selectedSiteId = null;
+        this._render();
+    }
+
+    show() {
+        this.overlay.style.display = 'block';
+        if (this._controlsEl) {
+            this._controlsEl.style.display = 'block';
+        }
+        if (this._hasHighRisk()) {
+            this._startAnimation();
+        }
+        this._render();
+    }
+
+    hide() {
+        this.overlay.style.display = 'none';
+        if (this._controlsEl) {
+            this._controlsEl.style.display = 'none';
+        }
+        this._stopAnimation();
+        this._hidePopup();
+    }
+
+    destroy() {
+        this._stopAnimation();
+        if (this.overlay && this.overlay.parentNode) {
+            this.overlay.parentNode.removeChild(this.overlay);
+        }
+        if (this._popupEl && this._popupEl.parentNode) {
+            this._popupEl.parentNode.removeChild(this._popupEl);
+        }
+        if (this._controlsEl && this._controlsEl.parentNode) {
+            this._controlsEl.parentNode.removeChild(this._controlsEl);
+        }
+        this.allZones = {};
+        this.currentZones = [];
+        this.spatialIndex = null;
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text || '';
+    return div.innerHTML;
+}

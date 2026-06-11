@@ -96,3 +96,64 @@ COPY backend/scripts /app/scripts
 COPY backend/services /app/services
 WORKDIR /app
 CMD ["python", "-m", "scripts.run_simulator"]
+
+# ===== agriculture_impact 服务 =====
+FROM base AS agriculture_impact
+COPY backend/common /app/backend/common
+COPY backend/services/agriculture_impact /app/backend/services/agriculture_impact
+COPY backend/scripts /app/backend/scripts
+WORKDIR /app
+EXPOSE 8005
+CMD ["gunicorn", \
+    "-k", "uvicorn.workers.UvicornWorker", \
+    "--workers", "4", \
+    "--threads", "4", \
+    "--timeout", "300", \
+    "--bind", "0.0.0.0:8005", \
+    "backend.services.agriculture_impact.main:app"]
+
+# ===== network_analyzer 服务 =====
+FROM base AS network_analyzer
+COPY backend/common /app/backend/common
+COPY backend/services/network_analyzer /app/backend/services/network_analyzer
+COPY backend/scripts /app/backend/scripts
+WORKDIR /app
+EXPOSE 8006
+CMD ["gunicorn", \
+    "-k", "uvicorn.workers.UvicornWorker", \
+    "--workers", "4", \
+    "--threads", "4", \
+    "--timeout", "300", \
+    "--bind", "0.0.0.0:8006", \
+    "backend.services.network_analyzer.main:app"]
+
+# ===== climate_vulnerability 服务 =====
+FROM base AS climate_vulnerability
+COPY backend/common /app/backend/common
+COPY backend/services/climate_vulnerability /app/backend/services/climate_vulnerability
+COPY backend/scripts /app/backend/scripts
+WORKDIR /app
+EXPOSE 8007
+CMD ["gunicorn", \
+    "-k", "uvicorn.workers.UvicornWorker", \
+    "--workers", "4", \
+    "--threads", "4", \
+    "--timeout", "600", \
+    "--bind", "0.0.0.0:8007", \
+    "backend.services.climate_vulnerability.main:app"]
+
+# ===== digital_exhibit 服务 =====
+FROM base AS digital_exhibit
+RUN mkdir -p /app/data/models /app/data/photos
+COPY backend/common /app/backend/common
+COPY backend/services/digital_exhibit /app/backend/services/digital_exhibit
+COPY backend/scripts /app/backend/scripts
+WORKDIR /app
+EXPOSE 8008
+CMD ["gunicorn", \
+    "-k", "uvicorn.workers.UvicornWorker", \
+    "--workers", "2", \
+    "--threads", "4", \
+    "--timeout", "1800", \
+    "--bind", "0.0.0.0:8008", \
+    "backend.services.digital_exhibit.main:app"]

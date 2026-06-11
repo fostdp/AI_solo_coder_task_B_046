@@ -20,7 +20,7 @@ logger = logging.getLogger("api_gateway")
 
 app = FastAPI(
     title="古代水利工程遗迹系统 - API网关",
-    description="统一API入口，聚合遗迹数据、水力复原、可持续性评估、告警推送服务",
+    description="统一API入口，聚合遗迹数据、水力复原、可持续性评估、告警推送、农业影响评估、网络分析、气候脆弱性评估、数字化展示服务",
     version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -40,6 +40,10 @@ SERVICES = {
     "hydro": f"http://localhost:{settings.HYDRO_RECONSTRUCTOR_PORT}",
     "sustainability": f"http://localhost:{settings.SUSTAINABILITY_EVALUATOR_PORT}",
     "alarm": f"http://localhost:{settings.ALARM_PUBLISHER_PORT}",
+    "agriculture_impact": "http://agriculture_impact:8005",
+    "network_analyzer": "http://network_analyzer:8006",
+    "climate_vulnerability": "http://climate_vulnerability:8007",
+    "digital_exhibit": "http://digital_exhibit:8008",
 }
 
 
@@ -85,6 +89,10 @@ async def root():
             "hydro_reconstructor": f"{SERVICES['hydro']}/health",
             "sustainability_evaluator": f"{SERVICES['sustainability']}/health",
             "alarm_publisher": f"{SERVICES['alarm']}/health",
+            "agriculture_impact": f"{SERVICES['agriculture_impact']}/health",
+            "network_analyzer": f"{SERVICES['network_analyzer']}/health",
+            "climate_vulnerability": f"{SERVICES['climate_vulnerability']}/health",
+            "digital_exhibit": f"{SERVICES['digital_exhibit']}/health",
         },
         "endpoints": {
             "sites": "/api/sites",
@@ -95,6 +103,10 @@ async def root():
             "cross_section": "/api/cross-section/{site_id}",
             "alerts": "/api/alerts",
             "comprehensive": "/api/sites/{id}/comprehensive",
+            "agriculture_impact": "/api/v1/agriculture/*",
+            "network_analyzer": "/api/v1/network/*",
+            "climate_vulnerability": "/api/v1/climate/*",
+            "digital_exhibit": "/api/v1/digital/*",
         }
     }
 
@@ -177,7 +189,7 @@ async def delete_site(site_id: int):
 
 @app.get("/api/sites/{site_id}/comprehensive")
 async def get_comprehensive(site_id: int):
-    """获取综合信息（聚合三个服务的数据）"""
+    """获取综合信息（聚合七个服务的数据）"""
     results = {}
 
     # 并行请求
@@ -187,17 +199,48 @@ async def get_comprehensive(site_id: int):
             site_task = client.get(f"{SERVICES['heritage']}/sites/{site_id}")
             resto_task = client.get(f"{SERVICES['hydro']}/restore/{site_id}")
             assess_task = client.get(f"{SERVICES['sustainability']}/assess/{site_id}")
+            agri_task = client.get(f"{SERVICES['agriculture_impact']}/sites/{site_id}/impact")
+            network_task = client.get(f"{SERVICES['network_analyzer']}/regions/default/latest")
+            climate_task = client.get(f"{SERVICES['climate_vulnerability']}/sites/{site_id}/assessments")
+            digital_task = client.get(f"{SERVICES['digital_exhibit']}/sites/{site_id}/model")
 
-            responses = await asyncio.gather(site_task, resto_task, assess_task,
-                                             return_exceptions=True)
+            responses = await asyncio.gather(
+                site_task, resto_task, assess_task,
+                agri_task, network_task, climate_task, digital_task,
+                return_exceptions=True
+            )
 
-            site_resp, resto_resp, assess_resp = responses
+            site_resp, resto_resp, assess_resp, agri_resp, network_resp, climate_resp, digital_resp = responses
 
             results["site"] = site_resp.json() if not isinstance(site_resp, Exception) and site_resp.status_code == 200 else None
 
             results["restoration"] = resto_resp.json() if not isinstance(resto_resp, Exception) and resto_resp.status_code == 200 else None
 
             results["assessment"] = assess_resp.json() if not isinstance(assess_resp, Exception) and assess_resp.status_code == 200 else None
+
+            results["agriculture_impact"] = agri_resp.json() if not isinstance(agri_resp, Exception) and agri_resp.status_code == 200 else None
+
+            network_membership = None
+            if not isinstance(network_resp, Exception) and network_resp.status_code == 200:
+                try:
+                    latest_data = network_resp.json()
+                    analysis_id = latest_data.get("id") if isinstance(latest_data, dict) else None
+                    if analysis_id:
+                        nodes_resp = await client.get(f"{SERVICES['network_analyzer']}/analysis/{analysis_id}/nodes", timeout=10.0)
+                        if nodes_resp.status_code == 200:
+                            nodes_data = nodes_resp.json()
+                            if isinstance(nodes_data, list):
+                                for node in nodes_data:
+                                    if isinstance(node, dict) and node.get("site_id") == site_id:
+                                        network_membership = node
+                                        break
+                except Exception:
+                    pass
+            results["network_membership"] = network_membership
+
+            results["climate_assessments"] = climate_resp.json() if not isinstance(climate_resp, Exception) and climate_resp.status_code == 200 else None
+
+            results["digital_reconstruction"] = digital_resp.json() if not isinstance(digital_resp, Exception) and digital_resp.status_code == 200 else None
 
         except Exception as e:
             logger.error(f"综合信息查询失败: {e}")
@@ -383,6 +426,303 @@ async def get_dynasties():
 @app.get("/api/regions")
 async def get_regions():
     return await forward_request("heritage", "/regions")
+
+
+# ==============================================
+# 农业影响评估 API
+# ==============================================
+
+@app.get("/api/v1/agriculture/health")
+async def agri_health():
+    return await forward_request("agriculture_impact", "/health")
+
+
+@app.get("/api/v1/agriculture/crop-yields")
+async def agri_list_crop_yields(skip: int = 0, limit: int = 100):
+    params = {"skip": skip, "limit": limit}
+    params = {k: v for k, v in params.items() if v is not None}
+    return await forward_request("agriculture_impact", "/crop-yields", "GET", params=params)
+
+
+@app.get("/api/v1/agriculture/crop-yields/{id}")
+async def agri_get_crop_yield(id: int):
+    return await forward_request("agriculture_impact", f"/crop-yields/{id}")
+
+
+@app.post("/api/v1/agriculture/crop-yields")
+async def agri_create_crop_yield(request: Request):
+    body = await request.json()
+    return await forward_request("agriculture_impact", "/crop-yields", "POST", json_data=body)
+
+
+@app.put("/api/v1/agriculture/crop-yields/{id}")
+async def agri_update_crop_yield(id: int, request: Request):
+    body = await request.json()
+    return await forward_request("agriculture_impact", f"/crop-yields/{id}", "PUT", json_data=body)
+
+
+@app.delete("/api/v1/agriculture/crop-yields/{id}")
+async def agri_delete_crop_yield(id: int):
+    return await forward_request("agriculture_impact", f"/crop-yields/{id}", "DELETE")
+
+
+@app.get("/api/v1/agriculture/sites/{site_id}/impact")
+async def agri_get_site_impact(site_id: int):
+    return await forward_request("agriculture_impact", f"/sites/{site_id}/impact")
+
+
+@app.post("/api/v1/agriculture/sites/{site_id}/impact")
+async def agri_create_site_impact(site_id: int, request: Request):
+    body = await request.json()
+    return await forward_request("agriculture_impact", f"/sites/{site_id}/impact", "POST", json_data=body)
+
+
+@app.get("/api/v1/agriculture/sites/{site_id}/impact/benefit-zone.geojson")
+async def agri_get_benefit_zone_geojson(site_id: int):
+    return await forward_request("agriculture_impact", f"/sites/{site_id}/impact/benefit-zone.geojson")
+
+
+@app.post("/api/v1/agriculture/batch/region")
+async def agri_batch_region(request: Request):
+    body = await request.json()
+    return await forward_request("agriculture_impact", "/batch/region", "POST", json_data=body)
+
+
+@app.get("/api/v1/agriculture/regions/{region}/impact-summary")
+async def agri_get_region_impact_summary(region: str):
+    return await forward_request("agriculture_impact", f"/regions/{region}/impact-summary")
+
+
+@app.get("/api/v1/agriculture/stats")
+async def agri_get_stats():
+    return await forward_request("agriculture_impact", "/stats")
+
+
+# ==============================================
+# 网络分析 API
+# ==============================================
+
+@app.get("/api/v1/network/health")
+async def network_health():
+    return await forward_request("network_analyzer", "/health")
+
+
+@app.get("/api/v1/network/regions")
+async def network_list_regions():
+    return await forward_request("network_analyzer", "/regions")
+
+
+@app.post("/api/v1/network/analyze/region")
+async def network_analyze_region(request: Request):
+    body = await request.json()
+    return await forward_request("network_analyzer", "/analyze/region", "POST", json_data=body)
+
+
+@app.get("/api/v1/network/regions/{region}/latest")
+async def network_get_region_latest(region: str):
+    return await forward_request("network_analyzer", f"/regions/{region}/latest")
+
+
+@app.get("/api/v1/network/regions/{region}/history")
+async def network_get_region_history(region: str, skip: int = 0, limit: int = 100):
+    params = {"skip": skip, "limit": limit}
+    params = {k: v for k, v in params.items() if v is not None}
+    return await forward_request("network_analyzer", f"/regions/{region}/history", "GET", params=params)
+
+
+@app.get("/api/v1/network/analysis/{id}")
+async def network_get_analysis(id: int):
+    return await forward_request("network_analyzer", f"/analysis/{id}")
+
+
+@app.delete("/api/v1/network/analysis/{id}")
+async def network_delete_analysis(id: int):
+    return await forward_request("network_analyzer", f"/analysis/{id}", "DELETE")
+
+
+@app.get("/api/v1/network/analysis/{id}/network.geojson")
+async def network_get_analysis_geojson(id: int):
+    return await forward_request("network_analyzer", f"/analysis/{id}/network.geojson")
+
+
+@app.get("/api/v1/network/analysis/{id}/nodes")
+async def network_get_analysis_nodes(id: int):
+    return await forward_request("network_analyzer", f"/analysis/{id}/nodes")
+
+
+@app.get("/api/v1/network/analysis/{id}/critical-nodes")
+async def network_get_analysis_critical_nodes(id: int):
+    return await forward_request("network_analyzer", f"/analysis/{id}/critical-nodes")
+
+
+@app.post("/api/v1/network/batch")
+async def network_batch(request: Request):
+    body = await request.json()
+    return await forward_request("network_analyzer", "/batch", "POST", json_data=body)
+
+
+@app.get("/api/v1/network/cross-region/summary")
+async def network_get_cross_region_summary():
+    return await forward_request("network_analyzer", "/cross-region/summary")
+
+
+@app.get("/api/v1/network/stats")
+async def network_get_stats():
+    return await forward_request("network_analyzer", "/stats")
+
+
+# ==============================================
+# 气候脆弱性评估 API
+# ==============================================
+
+@app.get("/api/v1/climate/health")
+async def climate_health():
+    return await forward_request("climate_vulnerability", "/health")
+
+
+@app.get("/api/v1/climate/scenarios")
+async def climate_list_scenarios():
+    return await forward_request("climate_vulnerability", "/scenarios")
+
+
+@app.get("/api/v1/climate/sites/{site_id}/assessments")
+async def climate_get_site_assessments(site_id: int):
+    return await forward_request("climate_vulnerability", f"/sites/{site_id}/assessments")
+
+
+@app.post("/api/v1/climate/sites/{site_id}/assess")
+async def climate_create_site_assessment(site_id: int, request: Request):
+    body = await request.json()
+    return await forward_request("climate_vulnerability", f"/sites/{site_id}/assess", "POST", json_data=body)
+
+
+@app.get("/api/v1/climate/sites/{site_id}/risks-summary")
+async def climate_get_site_risks_summary(site_id: int):
+    return await forward_request("climate_vulnerability", f"/sites/{site_id}/risks-summary")
+
+
+@app.get("/api/v1/climate/sites/{site_id}/risk-zone.geojson")
+async def climate_get_site_risk_zone_geojson(site_id: int):
+    return await forward_request("climate_vulnerability", f"/sites/{site_id}/risk-zone.geojson")
+
+
+@app.get("/api/v1/climate/sites/{site_id}/risk-matrix")
+async def climate_get_site_risk_matrix(site_id: int):
+    return await forward_request("climate_vulnerability", f"/sites/{site_id}/risk-matrix")
+
+
+@app.post("/api/v1/climate/batch/region")
+async def climate_batch_region(request: Request):
+    body = await request.json()
+    return await forward_request("climate_vulnerability", "/batch/region", "POST", json_data=body)
+
+
+@app.get("/api/v1/climate/regions/{region}/risk-map")
+async def climate_get_region_risk_map(region: str):
+    return await forward_request("climate_vulnerability", f"/regions/{region}/risk-map")
+
+
+@app.get("/api/v1/climate/regions/{region}/high-risk-list")
+async def climate_get_region_high_risk_list(region: str, skip: int = 0, limit: int = 100):
+    params = {"skip": skip, "limit": limit}
+    params = {k: v for k, v in params.items() if v is not None}
+    return await forward_request("climate_vulnerability", f"/regions/{region}/high-risk-list", "GET", params=params)
+
+
+@app.get("/api/v1/climate/stats")
+async def climate_get_stats():
+    return await forward_request("climate_vulnerability", "/stats")
+
+
+@app.get("/api/v1/climate/cross-scenario-comparison")
+async def climate_get_cross_scenario_comparison():
+    return await forward_request("climate_vulnerability", "/cross-scenario-comparison")
+
+
+# ==============================================
+# 数字化展示 API
+# ==============================================
+
+@app.get("/api/v1/digital/health")
+async def digital_health():
+    return await forward_request("digital_exhibit", "/health")
+
+
+@app.get("/api/v1/digital/methods")
+async def digital_list_methods():
+    return await forward_request("digital_exhibit", "/methods")
+
+
+@app.post("/api/v1/digital/sites/{site_id}/reconstruct")
+async def digital_reconstruct_site(site_id: int, request: Request):
+    body = await request.json()
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/reconstruct", "POST", json_data=body)
+
+
+@app.get("/api/v1/digital/sites/{site_id}/status")
+async def digital_get_site_status(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/status")
+
+
+@app.get("/api/v1/digital/sites/{site_id}/model")
+async def digital_get_site_model(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/model")
+
+
+@app.get("/api/v1/digital/sites/{site_id}/vr")
+async def digital_get_site_vr(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/vr")
+
+
+@app.get("/api/v1/digital/sites/{site_id}/hotspots")
+async def digital_list_site_hotspots(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/hotspots")
+
+
+@app.post("/api/v1/digital/sites/{site_id}/hotspots")
+async def digital_create_site_hotspot(site_id: int, request: Request):
+    body = await request.json()
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/hotspots", "POST", json_data=body)
+
+
+@app.delete("/api/v1/digital/sites/{site_id}/hotspots/{hotspot_id}")
+async def digital_delete_site_hotspot(site_id: int, hotspot_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/hotspots/{hotspot_id}", "DELETE")
+
+
+@app.get("/api/v1/digital/sites/{site_id}/reconstruction-log")
+async def digital_get_site_reconstruction_log(site_id: int, skip: int = 0, limit: int = 100):
+    params = {"skip": skip, "limit": limit}
+    params = {k: v for k, v in params.items() if v is not None}
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/reconstruction-log", "GET", params=params)
+
+
+@app.delete("/api/v1/digital/sites/{site_id}/model")
+async def digital_delete_site_model(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/model", "DELETE")
+
+
+@app.get("/api/v1/digital/sites/{site_id}/overlay")
+async def digital_get_site_overlay(site_id: int):
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/overlay")
+
+
+@app.post("/api/v1/digital/sites/{site_id}/toggle-overlay")
+async def digital_toggle_site_overlay(site_id: int, request: Request):
+    body = await request.json()
+    return await forward_request("digital_exhibit", f"/sites/{site_id}/toggle-overlay", "POST", json_data=body)
+
+
+@app.get("/api/v1/digital/gallery")
+async def digital_get_gallery(skip: int = 0, limit: int = 100):
+    params = {"skip": skip, "limit": limit}
+    params = {k: v for k, v in params.items() if v is not None}
+    return await forward_request("digital_exhibit", "/gallery", "GET", params=params)
+
+
+@app.get("/api/v1/digital/stats")
+async def digital_get_stats():
+    return await forward_request("digital_exhibit", "/stats")
 
 
 if __name__ == "__main__":

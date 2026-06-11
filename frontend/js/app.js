@@ -2,6 +2,7 @@
  * 古代水利工程遗迹系统 - 主应用
  * 职责：状态管理、API调用、组件协调、事件绑定
  * 依赖：water_heritage_map.js、hydro_profile.js、supply-range-renderer.js
+ * 新增依赖：benefit-renderer.js、climate-risk-renderer.js、network-layer.js、digital-exhibit-panel.js
  */
 
 // ========== API 配置 ==========
@@ -9,10 +10,19 @@ const API_BASE = `${window.location.origin}/api`;
 
 // ========== 应用状态 ==========
 const appState = {
-    map: null,           // WaterHeritageMap 实例
+    map: null,
     sites: [],
     supplyRanges: [],
     selectedSite: null,
+    benefitRenderer: null,
+    climateRiskRenderer: null,
+    networkLayer: null,
+    digitalExhibitPanel: null,
+    showBenefit: false,
+    showClimateRisk: false,
+    showNetwork: false,
+    currentNetworkRegion: null,
+    assessmentComputeLoading: null
 };
 
 // ========== 常量 ==========
@@ -30,22 +40,209 @@ const TYPE_NAMES = {
     '井': '水井'
 };
 
+const DEFAULT_RISK_SCENARIO = 'RCP4.5';
+const DEFAULT_RISK_YEAR = 2050;
+
 // ========== 初始化 ==========
 function initApp() {
-    // 初始化地图
     appState.map = new WaterHeritageMap('map', {
         onSiteSelect: handleSiteSelect
     });
 
-    // 加载数据
+    if (typeof BenefitRenderer !== 'undefined') {
+        appState.benefitRenderer = new BenefitRenderer(appState.map.map, {
+            onClick: (hit) => {
+                if (hit?.zone?.site_id) appState.map.selectSite(hit.zone.site_id);
+            }
+        });
+        appState.benefitRenderer.hide();
+    }
+
+    if (typeof ClimateRiskRenderer !== 'undefined') {
+        appState.climateRiskRenderer = new ClimateRiskRenderer(appState.map.map, {
+            onClick: (zone) => {
+                if (zone?.site_id) appState.map.selectSite(zone.site_id);
+            }
+        });
+        appState.climateRiskRenderer.hide();
+    }
+
+    if (typeof NetworkLayer !== 'undefined') {
+        appState.networkLayer = new NetworkLayer();
+        appState.networkLayer.addTo(appState.map.map);
+        appState.networkLayer.hide();
+    }
+
     loadDynasties();
     loadSites();
     loadStatistics();
     checkAlerts();
 
-    // 事件绑定
     setupEventListeners();
     setupSearch();
+    _injectAdvancedToolbar();
+
+    setTimeout(() => {
+        const detailPanel = document.getElementById('detailPanel');
+        if (detailPanel && typeof DigitalExhibitPanel !== 'undefined') {
+            appState.digitalExhibitPanel = new DigitalExhibitPanel();
+            appState.digitalExhibitPanel.init(detailPanel);
+        }
+    }, 300);
+}
+
+function _injectAdvancedToolbar() {
+    const sidebar = document.querySelector('.sidebar');
+    if (!sidebar) return;
+
+    const section = document.createElement('div');
+    section.className = 'sidebar-section';
+    section.id = 'advancedToolbar';
+    section.innerHTML = `
+        <h3>高级功能图层</h3>
+        <label class="checkbox-item">
+            <input type="checkbox" id="showBenefitZones">
+            <span>显示受益区</span>
+        </label>
+        <div id="climateControlGroup" style="margin-top:4px;margin-left:22px;display:none;">
+        </div>
+
+        <label class="checkbox-item">
+            <input type="checkbox" id="showClimateRisk">
+            <span>显示气候风险区</span>
+        </label>
+        <div id="riskControlGroup" style="margin:4px 0 4px 22px;display:none;">
+            <div style="font-size:11px;color:#718096;margin:4px 0;">
+                <label style="display:inline-block;width:44px;">情景:</label>
+                <select id="riskScenarioSelect" style="padding:2px 4px;font-size:11px;border:1px solid #cbd5e0;border-radius:3px;width:calc(100% - 50px);">
+                    <option value="RCP2.6">RCP2.6 (低排放)</option>
+                    <option value="RCP4.5" selected>RCP4.5 (中低)</option>
+                    <option value="RCP8.5">RCP8.5 (高排放)</option>
+                </select>
+            </div>
+            <div style="font-size:11px;color:#718096;margin:4px 0;">
+                <label style="display:inline-block;width:44px;">年份:</label>
+                <select id="riskYearSelect" style="padding:2px 4px;font-size:11px;border:1px solid #cbd5e0;border-radius:3px;width:calc(100% - 50px);">
+                    <option value="2030">2030年</option>
+                    <option value="2050" selected>2050年</option>
+                    <option value="2070">2070年</option>
+                    <option value="2100">2100年</option>
+                </select>
+            </div>
+        </div>
+
+        <label class="checkbox-item">
+            <input type="checkbox" id="showNetwork">
+            <span>显示水利网络</span>
+        </label>
+        <div id="networkControlGroup" style="margin:4px 0 4px 22px;display:none;">
+            <div style="font-size:11px;color:#718096;margin:4px 0;">
+                <label style="display:inline-block;width:44px;">区域:</label>
+                <select id="networkRegionSelect" style="padding:2px 4px;font-size:11px;border:1px solid #cbd5e0;border-radius:3px;width:calc(100% - 50px);">
+                    <option value="">-- 选择区域 --</option>
+                    <option value="关中平原">关中平原</option>
+                    <option value="成都平原">成都平原</option>
+                    <option value="江南地区">江南地区</option>
+                    <option value="中原地区">中原地区</option>
+                </select>
+            </div>
+        </div>
+
+        <button id="enterVRBtn" class="btn btn-info btn-small" style="margin-top:8px;width:100%;display:none;">🥽 进入VR模式</button>
+
+        <button id="computeAllAssessments" class="btn btn-warning btn-small" style="margin-top:10px;width:100%;">
+            ⚡ 一键计算全部新数据
+        </button>
+    `;
+
+    const existingSections = sidebar.querySelectorAll('.sidebar-section');
+    if (existingSections.length >= 3) {
+        sidebar.insertBefore(section, existingSections[3]);
+    } else {
+        sidebar.appendChild(section);
+    }
+
+    const showBenefitEl = section.querySelector('#showBenefitZones');
+    const showClimateEl = section.querySelector('#showClimateRisk');
+    const showNetworkEl = section.querySelector('#showNetwork');
+    const climateGroup = section.querySelector('#riskControlGroup');
+    const riskScenarioEl = section.querySelector('#riskScenarioSelect');
+    const riskYearEl = section.querySelector('#riskYearSelect');
+    const regionEl = section.querySelector('#networkRegionSelect');
+    const networkGroup = section.querySelector('#networkControlGroup');
+    const vrBtn = section.querySelector('#enterVRBtn');
+    const batchBtn = section.querySelector('#computeAllAssessments');
+
+    showBenefitEl?.addEventListener('change', (e) => {
+        appState.showBenefit = e.target.checked;
+        if (appState.benefitRenderer) {
+            e.target.checked ? appState.benefitRenderer.show() : appState.benefitRenderer.hide();
+        }
+        if (e.target.checked && appState.selectedSite) {
+            _triggerLoadBenefitForSelected();
+        }
+    });
+
+    showClimateEl?.addEventListener('change', (e) => {
+        appState.showClimateRisk = e.target.checked;
+        if (appState.climateRiskRenderer) {
+            e.target.checked ? appState.climateRiskRenderer.show() : appState.climateRiskRenderer.hide();
+        }
+        if (climateGroup) climateGroup.style.display = e.target.checked ? 'block' : 'none';
+        if (e.target.checked && appState.selectedSite) {
+            _triggerLoadClimateForSelected();
+        }
+    });
+
+    riskScenarioEl?.addEventListener('change', () => {
+        if (appState.climateRiskRenderer) {
+            const yr = parseInt(riskYearEl.value);
+            appState.climateRiskRenderer.setScenario(riskScenarioEl.value, yr);
+        }
+    });
+    riskYearEl?.addEventListener('change', () => {
+        if (appState.climateRiskRenderer) {
+            appState.climateRiskRenderer.setScenario(riskScenarioEl.value, parseInt(riskYearEl.value));
+        }
+    });
+
+    showNetworkEl?.addEventListener('change', (e) => {
+        appState.showNetwork = e.target.checked;
+        if (appState.networkLayer) {
+            e.target.checked ? appState.networkLayer.show() : appState.networkLayer.hide();
+        }
+        if (networkGroup) networkGroup.style.display = e.target.checked ? 'block' : 'none';
+    });
+
+    regionEl?.addEventListener('change', async () => {
+        if (!appState.networkLayer || !regionEl.value) return;
+        appState.currentNetworkRegion = regionEl.value;
+        try {
+            showToast(`加载网络数据: ${regionEl.value}...`, 'info');
+            await appState.networkLayer.loadNetwork(regionEl.value);
+            showToast('网络加载成功', 'success');
+        } catch (e) {
+            showToast('网络加载失败', 'error');
+        }
+    });
+
+    vrBtn?.addEventListener('click', () => {
+        showToast('VR模式启动中...（模拟', 'info');
+    });
+
+    batchBtn?.addEventListener('click', () => {
+        if (appState.selectedSite) {
+            _batchTriggerAllAssessments(appState.selectedSite);
+        } else {
+            showToast('请先选择一个遗迹', 'warning');
+        }
+    });
+}
+
+function _triggerLoadBenefitForSelected() {
+}
+
+function _triggerLoadClimateForSelected() {
 }
 
 // ========== 数据加载 ==========
@@ -157,42 +354,135 @@ async function handleSiteSelect(siteId) {
     document.getElementById('detailPanel').scrollTop = 0;
 
     try {
+        await loadSiteComprehensive(siteId);
+    } catch (e) {
+        panel.innerHTML = `<div class="empty-state"><p>加载失败：${e.message}</p></div>`;
+        console.error(e);
+    }
+}
+
+async function loadSiteComprehensive(site_id) {
+    try {
         const [compRes, hydroRes, sectionRes] = await Promise.all([
-            fetch(`${API_BASE}/sites/${siteId}/comprehensive`),
-            fetch(`${API_BASE}/hydrology/by-site/${siteId}?period=all`),
-            fetch(`${API_BASE}/cross-section/${siteId}`)
+            fetch(`${API_BASE}/sites/${site_id}/comprehensive`),
+            fetch(`${API_BASE}/hydrology/by-site/${site_id}?period=all`),
+            fetch(`${API_BASE}/cross-section/${site_id}`)
         ]);
 
         const comp = await compRes.json();
         const hydro = await hydroRes.json();
         const section = await sectionRes.json();
 
-        // 如果没有复原数据，自动触发
         if (comp.restoration === null) {
             try {
-                await fetch(`${API_BASE}/restoration/${siteId}?async_mode=false`, { method: 'POST' });
-                const newComp = await (await fetch(`${API_BASE}/sites/${siteId}/comprehensive`)).json();
+                await fetch(`${API_BASE}/restoration/${site_id}?async_mode=false`, { method: 'POST' });
+                const newComp = await (await fetch(`${API_BASE}/sites/${site_id}/comprehensive`)).json();
                 comp.restoration = newComp.restoration;
                 loadSupplyRanges();
             } catch (e) { console.warn('自动复原失败:', e); }
         }
 
-        // 如果没有评估数据，自动触发
         if (comp.assessment === null) {
             try {
-                await fetch(`${API_BASE}/assessment/${siteId}?async_mode=false`, { method: 'POST' });
-                const newComp = await (await fetch(`${API_BASE}/sites/${siteId}/comprehensive`)).json();
+                await fetch(`${API_BASE}/assessment/${site_id}?async_mode=false`, { method: 'POST' });
+                const newComp = await (await fetch(`${API_BASE}/sites/${site_id}/comprehensive`)).json();
                 comp.assessment = newComp.assessment;
             } catch (e) { console.warn('自动评估失败:', e); }
         }
 
         renderDetailPanel(comp, hydro, section);
-        appState.map.setSelected(siteId);
+        appState.map.setSelected(site_id);
         loadStatistics();
 
+        const site = comp.site;
+
+        if (comp.agriculture_impact && appState.benefitRenderer && appState.showBenefit) {
+            try {
+                const agriImpact = Array.isArray(comp.agriculture_impact) ? comp.agriculture_impact : [comp.agriculture_impact];
+                const benefitZones = agriImpact.map(ai => ({
+                    site_id: ai.site_id || site_id,
+                    site_name: ai.site_name || site?.name,
+                    yield_increase_rate: ai.yield_increase_rate ?? ai.rate ?? 0,
+                    core_geom: ai.core_geom || ai.core_zone,
+                    radiating_geom: ai.radiating_geom || ai.radiating_zone,
+                    marginal_geom: ai.marginal_geom || ai.marginal_zone
+                }));
+                appState.benefitRenderer.setBenefitZones(benefitZones);
+            } catch (e) { console.warn('加载受益区失败:', e); }
+        }
+
+        if (comp.climate_assessments && appState.climateRiskRenderer && appState.showClimateRisk) {
+            try {
+                const assessments = Array.isArray(comp.climate_assessments) ? comp.climate_assessments : [comp.climate_assessments];
+                const riskZones = assessments.map(ca => ({
+                    site_id: ca.site_id || site_id,
+                    site_name: ca.site_name || site?.name,
+                    risk_level: ca.risk_level || ca.level || 3,
+                    vulnerability_score: ca.vulnerability_score ?? ca.score,
+                    flood_depth: ca.flood_depth,
+                    drought_spei: ca.drought_spei,
+                    suggestions: ca.suggestions || ca.recommendations || [],
+                    geom: ca.geom || ca.zone_geom || ca.geometry
+                }));
+                const scenarioEl = document.querySelector('#riskScenarioSelect');
+                const yearEl = document.querySelector('#riskYearSelect');
+                const sc = scenarioEl?.value || DEFAULT_RISK_SCENARIO;
+                const yr = parseInt(yearEl?.value) || DEFAULT_RISK_YEAR;
+                appState.climateRiskRenderer.setRiskZones(riskZones, sc, yr);
+            } catch (e) { console.warn('加载风险区失败:', e); }
+        }
+
+        if (comp.network_membership && appState.networkLayer && appState.showNetwork) {
+            try {
+                const region = comp.network_membership.region || comp.network_membership.region_name || site?.region;
+                if (region) {
+                    const regionSelect = document.querySelector('#networkRegionSelect');
+                    if (regionSelect) regionSelect.value = region;
+                    appState.currentNetworkRegion = region;
+                    await appState.networkLayer.loadNetwork(region);
+                    setTimeout(() => appState.networkLayer.highlightCriticalNodes && appState.networkLayer.highlightCriticalNodes(), 800);
+                }
+            } catch (e) { console.warn('加载网络失败:', e); }
+        }
+
+        if (appState.digitalExhibitPanel) {
+            try {
+                await appState.digitalExhibitPanel.loadSite(site_id);
+                const vrBtn = document.querySelector('#enterVRBtn');
+                if (vrBtn) vrBtn.style.display = (comp.site?.has_3d_model || comp.model_available) ? 'inline-block' : 'none';
+            } catch (e) { console.warn('加载数字展陈失败:', e); }
+        }
+
     } catch (e) {
-        panel.innerHTML = `<div class="empty-state"><p>加载失败：${e.message}</p></div>`;
-        console.error(e);
+        throw e;
+    }
+}
+
+async function _batchTriggerAllAssessments(site_id) {
+    showToast('正在计算新功能数据...', 'info');
+    const site = appState.sites.find(s => s.id === site_id);
+    const region = site?.region || site?.region_name || 'default';
+
+    const tasks = [];
+
+    tasks.push(fetch(`${API_BASE}/agriculture/sites/${site_id}/impact`, { method: 'POST' }).catch(e => { console.warn('农业影响计算失败:', e); return null; }));
+    tasks.push(fetch(`${API_BASE}/climate/sites/${site_id}/assess`, { method: 'POST' }).catch(e => { console.warn('气候评估计算失败:', e); return null; }));
+    tasks.push(fetch(`${API_BASE}/network/analyze/region`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ region: region })
+    }).catch(e => { console.warn('网络分析计算失败:', e); return null; }));
+
+    try {
+        await Promise.all(tasks);
+        showToast('计算任务已提交，异步计算中', 'success');
+        setTimeout(async () => {
+            if (appState.selectedSite) {
+                handleSiteSelect(appState.selectedSite);
+            }
+        }, 2500);
+    } catch (e) {
+        showToast('部分任务提交完成，部分数据可能稍后就绪', 'warning');
     }
 }
 
@@ -204,7 +494,6 @@ function renderDetailPanel(comp, hydro, section) {
 
     let html = '';
 
-    // 基本信息
     html += `<div class="site-info-section">
         <div class="site-name">${escapeHtml(site.name)}</div>
         <div class="site-badges">
@@ -224,7 +513,6 @@ function renderDetailPanel(comp, hydro, section) {
         <div class="site-description">${escapeHtml(site.description || '暂无描述')}</div>
     </div>`;
 
-    // 可持续性评估
     if (assessment) {
         const ad = assessment.assessment_details || {};
         html += `<div class="site-info-section">
@@ -246,7 +534,6 @@ function renderDetailPanel(comp, hydro, section) {
             </div>
         </div>`;
 
-        // 群决策信息
         if (assessment.group_decision_info) {
             const gdi = assessment.group_decision_info;
             html += `<div class="site-info-section" style="margin-top:10px;">
@@ -259,7 +546,6 @@ function renderDetailPanel(comp, hydro, section) {
         }
     }
 
-    // 功能复原
     if (restoration) {
         html += `<div class="site-info-section">
             <div class="section-title">功能复原结果</div>
@@ -280,7 +566,6 @@ function renderDetailPanel(comp, hydro, section) {
             ${restoration.restoration_notes ? `<div class="restoration-notes">📊 ${escapeHtml(restoration.restoration_notes)}</div>` : ''}
         </div>`;
 
-        // 参数估计信息
         if (restoration.parameter_estimation) {
             const pe = restoration.parameter_estimation;
             html += `<div class="site-info-section" style="margin-top:10px;">
@@ -292,7 +577,6 @@ function renderDetailPanel(comp, hydro, section) {
             </div>`;
         }
 
-        // 蒙特卡洛信息
         if (restoration.uncertainty_analysis) {
             const ua = restoration.uncertainty_analysis;
             html += `<div class="site-info-section" style="margin-top:10px;">
@@ -306,7 +590,6 @@ function renderDetailPanel(comp, hydro, section) {
         }
     }
 
-    // 水文趋势图
     html += `<div class="site-info-section">
         <div class="section-title">水文变化趋势</div>
         <div class="chart-container">
@@ -319,7 +602,6 @@ function renderDetailPanel(comp, hydro, section) {
         </div>
     </div>`;
 
-    // 结构剖面图
     html += `<div class="site-info-section">
         <div class="section-title">结构剖面图 (${site.site_type})</div>
         <div class="cross-section-container">
@@ -329,7 +611,6 @@ function renderDetailPanel(comp, hydro, section) {
 
     panel.innerHTML = html;
 
-    // 绘制图表
     setTimeout(() => {
         drawHydroChart('hydroChart', hydro);
         drawCrossSection('crossSectionCanvas', section);
@@ -460,13 +741,14 @@ function setupEventListeners() {
             </div>`;
         appState.selectedSite = null;
         appState.map.setSelected(null);
+        if (appState.benefitRenderer) appState.benefitRenderer.clearSelected();
+        if (appState.climateRiskRenderer) appState.climateRiskRenderer.clearSelected();
     });
 
     document.getElementById('alertClose')?.addEventListener('click', () => {
         document.getElementById('alertBanner').style.display = 'none';
     });
 
-    // 窗口大小变化
     let resizeTimer;
     window.addEventListener('resize', () => {
         clearTimeout(resizeTimer);

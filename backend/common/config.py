@@ -72,5 +72,17 @@ class ChannelNames:
     BATCH_RESTORE_REQUESTED = "batch:restore:requested"
     BATCH_ASSESS_REQUESTED = "batch:assess:requested"
 
+    AGRICULTURE_IMPACT_COMPLETED = "agriculture:impact_completed"
+    NETWORK_ANALYSIS_COMPLETED = "network:analysis_completed"
+    CLIMATE_VULNERABILITY_COMPLETED = "climate:vulnerability_completed"
+    DIGITAL_RECONSTRUCTION_REQUESTED = "digital:reconstruction_requested"
+    DIGITAL_RECONSTRUCTION_COMPLETED = "digital:reconstruction_completed"
+    BATCH_AGRICULTURE_REQUESTED = "agriculture:batch_requested"
+    BATCH_NETWORK_REQUESTED = "network:batch_requested"
+    BATCH_CLIMATE_REQUESTED = "climate:batch_requested"
+    RISK_ALERT_TRIGGERED = "risk:alert_triggered"
+    SYNERGY_EFFECT_DETECTED = "network:synergy_detected"
+    VR_EXPERIENCE_GENERATED = "digital:vr_generated"
+
 
 channels = ChannelNames()

@@ -170,6 +170,124 @@ services:
     networks:
       - heritage-net
 
+  # ============== 微服务: agriculture_impact ==============
+  agriculture-impact:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: agriculture_impact
+    container_name: wh-agriculture-impact
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-water_heritage}:${POSTGRES_PASSWORD:-Heritage@2024!}@postgres:5432/${POSTGRES_DB:-water_heritage}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-Redis@2024!}@redis:6379/0
+      SERVICE_NAME: agriculture_impact
+      PORT: 8005
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./backend/services/agriculture_impact:/app/backend/services/agriculture_impact
+      - ./backend/common:/app/backend/common
+      - ./backend/scripts:/app/backend/scripts
+    command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "--workers", "4", "--threads", "4", "--timeout", "300", "--bind", "0.0.0.0:8005", "backend.services.agriculture_impact.main:app"]
+    networks:
+      - heritage-net
+
+  # ============== 微服务: network_analyzer ==============
+  network-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: network_analyzer
+    container_name: wh-network-analyzer
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-water_heritage}:${POSTGRES_PASSWORD:-Heritage@2024!}@postgres:5432/${POSTGRES_DB:-water_heritage}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-Redis@2024!}@redis:6379/0
+      SERVICE_NAME: network_analyzer
+      PORT: 8006
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8006:8006"
+    volumes:
+      - ./backend/services/network_analyzer:/app/backend/services/network_analyzer
+      - ./backend/common:/app/backend/common
+      - ./backend/scripts:/app/backend/scripts
+    command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "--workers", "4", "--threads", "4", "--timeout", "300", "--bind", "0.0.0.0:8006", "backend.services.network_analyzer.main:app"]
+    networks:
+      - heritage-net
+
+  # ============== 微服务: climate_vulnerability ==============
+  climate-vulnerability:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: climate_vulnerability
+    container_name: wh-climate-vulnerability
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-water_heritage}:${POSTGRES_PASSWORD:-Heritage@2024!}@postgres:5432/${POSTGRES_DB:-water_heritage}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-Redis@2024!}@redis:6379/0
+      SERVICE_NAME: climate_vulnerability
+      PORT: 8007
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8007:8007"
+    volumes:
+      - ./backend/services/climate_vulnerability:/app/backend/services/climate_vulnerability
+      - ./backend/common:/app/backend/common
+      - ./backend/scripts:/app/backend/scripts
+    command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "--workers", "4", "--threads", "4", "--timeout", "600", "--bind", "0.0.0.0:8007", "backend.services.climate_vulnerability.main:app"]
+    networks:
+      - heritage-net
+
+  # ============== 微服务: digital_exhibit ==============
+  digital-exhibit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: digital_exhibit
+    container_name: wh-digital-exhibit
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      DATABASE_URL: postgresql://${POSTGRES_USER:-water_heritage}:${POSTGRES_PASSWORD:-Heritage@2024!}@postgres:5432/${POSTGRES_DB:-water_heritage}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-Redis@2024!}@redis:6379/0
+      SERVICE_NAME: digital_exhibit
+      PORT: 8008
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8008:8008"
+    volumes:
+      - ./backend/services/digital_exhibit:/app/backend/services/digital_exhibit
+      - ./backend/common:/app/backend/common
+      - ./backend/scripts:/app/backend/scripts
+      - ./data/models:/app/data/models
+      - ./data/photos:/app/data/photos
+    command: ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "--workers", "2", "--threads", "4", "--timeout", "1800", "--bind", "0.0.0.0:8008", "backend.services.digital_exhibit.main:app"]
+    networks:
+      - heritage-net
+
   # ============== API 网关 ==============
   gateway:
     build:
@@ -223,6 +341,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ./backend/services/agriculture_impact:/app/backend/services/agriculture_impact
+      - ./backend/services/network_analyzer:/app/backend/services/network_analyzer
+      - ./backend/services/climate_vulnerability:/app/backend/services/climate_vulnerability
+      - ./backend/services/digital_exhibit:/app/backend/services/digital_exhibit
     profiles:
       - simulator
     networks:
@@ -233,6 +356,8 @@ volumes:
   redis-data:
   mosquitto-data:
   mosquitto-log:
+  data_models:
+  data_photos:
 
 networks:
   heritage-net:
